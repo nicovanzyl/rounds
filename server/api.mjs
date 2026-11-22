@@ -11,6 +11,8 @@ import { buildIndex, keepImage, hasSips, which, DATA, STORE, IMG } from "./index
 import { pastPushes, importPushes } from "./history.mjs";
 import { applyMoves, fileTopics, filePostTopics, loadTopics } from "./topics.mjs";
 import { POSTS, projects, loadConfig } from "./config.mjs";
+import { SNAPSHOT_MARK } from "./remote-content.mjs";
+import { updateComments } from "./comments-store.mjs";
 import { watchReleases, versionState, runUpdate, handOver } from "./updates.mjs";
 
 const SHOTS = path.join(DATA, "shots");
@@ -167,7 +169,11 @@ const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8"))
 // keeps the note on the canvas, and the pin says so.
 // The relay is opt-in ("relay": true in config); without it a desktop thread's note goes by the
 // hook like any other.
-const route = (t) => (!t ? "kept" : t.startsWith("local_") && loadConfig().relay ? "relay" : "hook");
+function route(thread) {
+  if (!thread) return "kept";
+  if (thread.startsWith("mcp-") || thread.startsWith("codex-")) return "mcp";
+  return thread.startsWith("local_") && loadConfig().relay ? "relay" : "hook";
+}
 
 // Every note with where it goes, said plainly on its pin. A note pinned before the canvas knew
 // whose post it was finds its session once the tool hook has tied the post to it; the notes
@@ -176,11 +182,17 @@ function comments(idx) {
   const list = readJSON(COMMENTS, []);
   idx ||= withLivePosts(readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] }));
   const threads = new Map((idx.threads || []).map((t) => [t.id, t]));
-  for (const c of list) {
+  const hidden = new Set(readJSON(path.join(DATA, "private-history.json"), {}).sessions || []);
+  const added = readJSON(ADDED, { sets: [], pages: [] });
+  const pages = new Set([...idx.pages, ...added.pages].map((p) => p.id));
+  const sets = new Set([...idx.sets, ...added.sets].map((s) => s.id));
+  const visible = list.filter((c) => !hidden.has(c.thread) && (c.set ? sets.has(c.set) : c.page.startsWith("shot-") || pages.has(c.page)));
+  for (const c of visible) {
     if (!c.thread) {
-      const made = (idx.sets || []).find((x) => x.thread && x.shots.some((s) => s.hash === c.hash))
-        || (idx.pages || []).find((x) => x.thread && x.versions.some((v) => v.hash === c.hash));
-      if (made) Object.assign(c, { thread: made.thread, state: "queued", route: "hook" });
+      const page = idx.pages.find((x) => x.id === c.page);
+      const madeBy = page?.versions.findLast((v) => v.hash === c.hash)?.thread || page?.thread
+        || idx.sets.find((x) => (!c.set || x.id === c.set) && x.shots.some((s) => s.hash === c.hash))?.thread;
+      if (madeBy) Object.assign(c, { thread: madeBy, state: "queued", route: route(madeBy) });
     }
     c.route ||= route(c.thread);
     c.threadTitle ||= threads.get(c.thread)?.title || null;
@@ -190,34 +202,51 @@ function comments(idx) {
     const s = readJSON(path.join(SENT, `${c.id}.json`), null);
     if (s) Object.assign(c, { state: "sent", delivery: s.delivery || "delivered" });
   }
-  return list;
+  return visible;
 }
 
 // Posts that landed since the last index show at once; the next index ties them to their thread.
 function withLivePosts(idx) {
   let posts = [];
-  try { posts = fs.readdirSync(POSTS).map((f) => readJSON(path.join(POSTS, f), null)).filter(Boolean).sort((a, b) => a.at - b.at); } catch {}
+  try { posts = fs.readdirSync(POSTS).filter((f) => f.endsWith(".json")).map((f) => readJSON(path.join(POSTS, f), null)).filter(Boolean).sort((a, b) => a.at - b.at); } catch {}
   if (!posts.length) return idx;
   const P = projects();
   const byId = new Map(posts.map((p) => [p.id, p]));
-  const have = new Set(idx.sets.map((s) => s.id));
-  const pageHave = new Set(idx.pages.flatMap((p) => p.versions.map((v) => v.hash)));
+  const sets = new Map(idx.sets.map((s) => [s.id, s]));
+  const latestAt = new Map(idx.pages.map((p) => [p.id, p.at]));
+  const hidden = new Set(readJSON(path.join(DATA, "private-history.json"), {}).sessions || []);
   // the session a post was made in (the tool hook records it): its desktop thread, or itself
   const threadOf = (s) => (s && (idx.threads.find((t) => t.id === s || (t.clis || []).includes(s))?.id || s)) || null;
-  for (const s of idx.sets) if (!s.thread && byId.get(s.id)?.session) s.thread = threadOf(byId.get(s.id).session);
+  for (const s of idx.sets) {
+    const session = byId.get(s.id)?.session;
+    if (!s.thread && session && !hidden.has(session)) s.thread = threadOf(session);
+  }
   for (const p of posts) {
     // what the config keeps private stays off the canvas, posted or not (the indexer skips it too)
-    if (P.isPrivate(p.caption, p.cwd, p.topic, p.sessionTitle, p.page?.title)) continue;
-    const project = P.of([p.caption], p.cwd);
-    if (p.shots?.length && !have.has(p.id)) {
-      const before = p.before?.length ? p.before : (p.replaces && byId.get(p.replaces)?.shots) || [];
-      idx.sets.push({ id: p.id, thread: threadOf(p.session), project, at: p.at, caption: p.caption, topic: p.topic, kind: p.kind, shots: p.shots, ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}) });
+    if (p.at < (idx.scanStartedAt ?? idx.builtAt) || hidden.has(p.session) || P.isPrivate(p.caption, p.cwd, p.topic, p.sessionTitle, p.page?.title)) continue;
+    const thread = threadOf(p.session);
+    let owner = thread && idx.threads.find((t) => t.id === thread);
+    if (P.isPrivate(owner?.title, owner?.cwd)) continue;
+    const project = owner ? owner.project : P.of([p.sessionTitle || p.caption], p.cwd);
+    if (!owner && thread && p.sessionTitle) {
+      owner = { id: thread, title: p.sessionTitle, cwd: p.cwd || "", archived: false, at: p.at, recap: "", project, cli: true, days: {}, client: p.client };
+      idx.threads.push(owner);
     }
-    if (p.page && !pageHave.has(p.page.hash)) {
+    if ((p.shots?.length || p.kind === "change") && !sets.has(p.id)) {
+      const before = p.before?.length ? p.before : sets.get(p.replaces)?.shots || [];
+      const set = { id: p.id, thread, project, at: p.at, caption: p.caption, topic: p.topic, kind: p.kind, shots: p.shots || [], ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}) };
+      idx.sets.push(set);
+      sets.set(set.id, set);
+    }
+    if (p.page) {
       const id = `post-${p.page.key}`;
+      if ((latestAt.get(id) ?? -1) >= p.at) continue;
       let pg = idx.pages.find((x) => x.id === id);
-      if (!pg) idx.pages.push((pg = { id, url: "", title: p.page.title, thread: threadOf(p.session), project, at: p.at, dir: path.dirname(p.page.path), versions: [], posted: true }));
-      pg.versions.push({ at: p.at, hash: p.page.hash });
+      if (!pg) idx.pages.push((pg = { id, url: "", project, dir: p.page.path ? path.dirname(p.page.path) : null, versions: [], posted: true }));
+      if (pg.versions.at(-1)?.hash !== p.page.hash) pg.versions.push({ at: p.at, hash: p.page.hash, thread });
+      else pg.versions.at(-1).thread = thread;
+      pg.title = p.page.title;
+      pg.thread = thread;
       pg.at = p.at;
       if (p.topic) pg.topic = p.topic;
     }
@@ -386,11 +415,11 @@ export async function handle(req, res, next) {
               // a session no longer on this Mac can't hear it: the note stays on the canvas
               const to = thread?.gone ? null : set.thread;
               const comment = {
-                id: crypto.randomUUID().slice(0, 8), page: c.page, hash: c.hash, x: c.x, y: c.y,
+                id: crypto.randomUUID().slice(0, 8), page: c.page, set: set.id, hash: c.hash, x: c.x, y: c.y,
                 text: c.text.trim(), at: Date.now(), thread: set.thread || null, state: to ? "queued" : "kept",
                 route: route(to), threadTitle: thread?.title || null,
               };
-              fs.writeFileSync(COMMENTS, JSON.stringify([...readJSON(COMMENTS, []), comment], null, 1));
+              await updateComments((list) => list.push(comment));
               if (comment.route === "relay") {
                 fs.writeFileSync(path.join(INBOX, `${comment.id}.json`), JSON.stringify({
                   ...comment,
@@ -405,9 +434,10 @@ export async function handle(req, res, next) {
               return json(res, comment);
             }
             const page = idx.pages.find((x) => x.id === c.page);
-            if (!page || !c.text?.trim()) return json(res, { error: "bad" }, 400);
-            const thread = idx.threads.find((t) => t.id === page.thread);
-            const to = thread?.gone ? null : page.thread;
+            if (!page?.versions.some((v) => v.hash === c.hash) || !c.text?.trim()) return json(res, { error: "bad" }, 400);
+            const owner = page.versions.findLast((v) => v.hash === c.hash)?.thread || page.thread;
+            const thread = idx.threads.find((t) => t.id === owner);
+            const to = thread?.gone ? null : owner;
             const comment = {
               id: crypto.randomUUID().slice(0, 8),
               page: page.id,
@@ -415,12 +445,12 @@ export async function handle(req, res, next) {
               x: c.x, y: c.y,
               text: c.text.trim(),
               at: Date.now(),
-              thread: page.thread || null,
+              thread: owner || null,
               state: to ? "queued" : "kept",
               route: route(to),
               threadTitle: thread?.title || null,
             };
-            fs.writeFileSync(COMMENTS, JSON.stringify([...readJSON(COMMENTS, []), comment], null, 1));
+            await updateComments((list) => list.push(comment));
             if (comment.route === "relay") {
               fs.writeFileSync(path.join(INBOX, `${comment.id}.json`), JSON.stringify({
                 ...comment,
@@ -441,7 +471,10 @@ export async function handle(req, res, next) {
             const idx = readJSON(path.join(DATA, "index.json"), { pages: [] });
             const page = idx.pages.find((x) => x.versions.some((v) => v.hash === m[1]));
             let html = fs.readFileSync(f, "utf8");
-            if (page?.dir && fs.existsSync(page.dir) && !/<base\s/i.test(html)) {
+            if (html.startsWith(SNAPSHOT_MARK)) {
+              res.setHeader("Content-Security-Policy", "sandbox allow-same-origin; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none'");
+              res.setHeader("Referrer-Policy", "no-referrer");
+            } else if (page?.dir && fs.existsSync(page.dir) && !/<base\s/i.test(html)) {
               const base = `<base href="/api/asset/${page.id}/">`;
               html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (h) => h + base) : base + html;
             }

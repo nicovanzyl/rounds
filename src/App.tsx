@@ -80,7 +80,7 @@ export default function App() {
   const [searching, setSearching] = useState(false);
   const [lit, setLit] = useState<string | null>(null);
   // one session, picked in search: the canvas and the timeline show only what it made, all of it
-  const [chat, setChat] = useState<string | null>(null);
+  const [chat, setChat] = useState<string | null>(() => new URLSearchParams(location.search).get("session"));
   // after the canvas re-forms for a session (or for everything again): where the camera lands
   const refit = useRef<{ to: "session" | "all"; find?: string } | null>(null);
   const finding = useRef<{ id: string; at: number; back: boolean; still?: boolean } | null>(null);
@@ -748,7 +748,7 @@ export default function App() {
   const onFile = useCallback((sheet: FilesSheet, i: number, el: HTMLElement) => { if (!latest.current.suppressClick()) latest.current.openFile(sheet, i, el); }, []);
   const onSession = useCallback((id: string) => { if (!latest.current.suppressClick()) latest.current.showSession(id); }, []);
 
-  const noted = useMemo(() => new Set((index?.comments ?? []).map((c) => c.page)), [index]);
+  const noted = useMemo(() => new Set((index?.comments ?? []).map((c) => c.set ? `${c.set}/${c.page}` : c.page)), [index]);
   const gone = useMemo(() => new Set((index?.threads ?? []).filter((t) => t.gone).map((t) => t.id)), [index]);
   // Tab walks the canvas: the camera brings what has focus into view. The window itself never
   // scrolls; a focused card off screen would otherwise shift the whole canvas and leave it there.

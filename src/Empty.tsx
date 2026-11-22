@@ -35,7 +35,7 @@ export function Empty({ onImported }: { onImported: () => void }) {
       <div className="flex max-w-[440px] flex-col items-center px-6 text-center" style={{ animation: "wb-empty 500ms var(--ease-out) both" }}>
         <div className="text-[30px] font-semibold tracking-[-0.02em] text-[var(--ink)]">Nothing here yet</div>
         <p className="mt-3 text-[15px] leading-[1.5] text-[var(--muted)]">
-          When a Claude session shows you a screen, publishes a page or pushes to main, it lands here, under its project.
+          When a connected session shares a screen, publishes a page or records a push, it lands here, under its project.
         </p>
         {found > 0 && (
           <button

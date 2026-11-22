@@ -365,6 +365,7 @@ function whereTo(note: Comment) {
   if (note.state === "sent") return `Sent to ${to}`;
   if (note.state === "kept" || note.route === "kept") return note.thread ? "Stays here: its session is no longer on this Mac" : "Stays here: no session made this";
   if (note.route === "relay") return `On its way to ${to}`;
+  if (note.route === "mcp") return `Available when ${to} checks Rounds`;
   return `Goes to ${to} with your next message there`;
 }
 

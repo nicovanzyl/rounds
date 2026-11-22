@@ -1,4 +1,4 @@
-// Reads the desktop app's thread records and every Claude Code transcript on this Mac,
+// Reads local Claude and Codex sessions,
 // and rebuilds each published page at every publish by replaying Write and Edit calls.
 // Output: index.json in the Rounds data folder, plus content-addressed snapshots in its store.
 import fs from "node:fs";
@@ -8,8 +8,9 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import { execFileSync } from "node:child_process";
 
-import { HOME, DATA, STORE, IMG, POSTS, PUSHES, PUBLISHED, CLAUDE, DESKTOP_SESSIONS, projects } from "./config.mjs";
+import { HOME, DATA, STORE, IMG, POSTS, PUSHES, PUBLISHED, CLAUDE, DESKTOP_SESSIONS, projects, loadConfig } from "./config.mjs";
 import { filePostTopics } from "./topics.mjs";
+import { codexSessions, isCodexData } from "./codex-history.mjs";
 export { DATA, STORE, IMG };
 const TRANSCRIPTS = path.join(CLAUDE, "projects");
 
@@ -39,7 +40,7 @@ function walk(dir, test, out = []) {
   return out;
 }
 
-function readThreads(P) {
+function readThreads(P, hidden) {
   const threads = new Map();
   const byCli = new Map();
   for (const file of walk(DESKTOP_SESSIONS, (n) => n.startsWith("local_") && n.endsWith(".json"))) {
@@ -56,7 +57,11 @@ function readThreads(P) {
       recap,
       clis: [s.cliSessionId, s.lastAssistantCliSessionId].filter(Boolean),
     };
-    if (P.isPrivate(t.title, t.cwd)) continue;
+    if (P.isPrivate(t.title, t.cwd)) {
+      hidden.add(t.id);
+      for (const cli of t.clis) hidden.add(cli);
+      continue;
+    }
     threads.set(t.id, t);
     for (const cli of [s.cliSessionId, s.lastAssistantCliSessionId]) if (cli) byCli.set(cli, t.id);
   }
@@ -137,7 +142,7 @@ function repoFinder() {
   };
   return {
     find(file) {
-      if (!path.isAbsolute(file) || off(file)) return null;
+      if (!path.isAbsolute(file) || off(file) || isCodexData(file)) return null;
       for (let d = path.dirname(file); d !== HOME && d !== path.dirname(d); d = path.dirname(d)) {
         const r = at(d);
         if (r) return { repo: r.repo, file: path.relative(r.root, file) };
@@ -231,7 +236,7 @@ async function readTranscript(file, onPublish, onDay, onSend, onMeta = () => {},
       } else if (c.type === "tool_result" && posting.has(c.tool_use_id)) {
         posting.delete(c.tool_use_id);
         const body = typeof c.content === "string" ? c.content : JSON.stringify(c.content || "");
-        const m = body.match(POST_RE);
+        const m = body.match(/\bto (?:Rounds|Workbench) as post ([a-f0-9]{16})\b/i) || body.match(POST_RE);
         if (m && !c.is_error) onPost(m[1], row.sessionId);
       } else if (c.type === "tool_result" && sending.has(c.tool_use_id)) {
         const send = sending.get(c.tool_use_id);
@@ -317,35 +322,42 @@ export function keepImage(file) {
   return meta;
 }
 
-const readDir = (dir) => { try { return fs.readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))); } catch { return []; } };
+function readDir(dir) {
+  const records = [];
+  let files;
+  try { files = fs.readdirSync(dir); } catch { return records; }
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    try { records.push(JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"))); } catch {}
+  }
+  return records;
+}
 
 // Posts the MCP server wrote (see server/mcp.mjs). Screens become a set; a page becomes a version
 // of the page at that path, so posting the same file again makes a before and after; a change
 // becomes a set of after screens, each with its before. Pushes the git hook saw become text.
-function readPosts(P, threads, postThread, pages, sets) {
-  const posts = readDir(POSTS).sort((a, b) => a.at - b.at);
+function readPosts(posts, P, threads, postThread, pages, sets) {
   const byId = new Map(posts.map((p) => [p.id, p]));
   for (const p of posts) {
     const threadId = postThread.get(p.id) || null;
     const thread = threadId ? threads.get(threadId) : null;
-    if (P.isPrivate(p.caption, p.cwd, thread?.title)) continue;
     const project = thread ? P.of([thread.title], thread.cwd) : P.of([p.caption], p.cwd);
     if (p.page) {
       const id = `post-${p.page.key}`;
       const page = pages.get(id) || { id, url: "", filePath: p.page.path, thread: threadId, versions: [], project, cwd: p.cwd, posted: true };
       page.title = p.page.title || page.title;
       page.topic = p.topic || page.topic;
-      page.versions.push({ at: p.at, text: (() => { try { return fs.readFileSync(path.join(STORE, `${p.page.hash}.html`), "utf8"); } catch { return null; } })() });
+      page.versions.push({ at: p.at, thread: threadId, text: (() => { try { return fs.readFileSync(path.join(STORE, `${p.page.hash}.html`), "utf8"); } catch { return null; } })() });
       if (threadId) page.thread = threadId;
       pages.set(id, page);
     }
-    if (!p.shots?.length) continue;
+    if (!p.shots?.length && p.kind !== "change") continue;
     // before screens: given with the post, or the screens of the post it replaces, by position
     const prev = p.replaces ? byId.get(p.replaces) : null;
     const before = p.before?.length ? p.before : prev?.shots || [];
     sets.push({
       id: p.id, thread: threadId, project, at: p.at, caption: p.caption || "", topic: p.topic || "",
-      kind: p.kind, shots: p.shots, ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}),
+      kind: p.kind, shots: p.shots || [], ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}),
     });
   }
   for (const x of readDir(PUSHES)) {
@@ -371,9 +383,8 @@ const titleOf = (html) => {
 // on the canvas, but there's nothing left in Claude to open or send a note to. Posts and pushes
 // keep their own records in the data folder and are read from there. What the config now keeps
 // private still leaves.
-function keepSeen(index, P) {
-  let prev;
-  try { prev = JSON.parse(fs.readFileSync(path.join(DATA, "index.json"), "utf8")); } catch { return 0; }
+function keepSeen(index, P, hidden, prev) {
+  if (!prev) return 0;
   const threads = new Map(index.threads.map((t) => [t.id, t]));
   // a send's session as it is now, or as the last index knew it (to judge a session gone private)
   const was = new Map((prev.threads || []).map((t) => [t.id, t]));
@@ -386,7 +397,7 @@ function keepSeen(index, P) {
       for (const [d, n] of Object.entries(t.days || {})) if (!(now.days[d] >= n)) now.days[d] = n;
       continue;
     }
-    if (P.isPrivate(t.title, t.cwd)) continue;
+    if (hidden.has(t.id) || P.isPrivate(t.title, t.cwd)) continue;
     const g = { ...t, gone: true, project: P.of([t.title], t.cwd) };
     index.threads.push(g);
     threads.set(t.id, g);
@@ -401,7 +412,7 @@ function keepSeen(index, P) {
   for (const x of prev.sets || []) {
     if (x.kind || have.has(x.id)) continue; // only sends read from transcripts have no kind
     const t = x.thread ? threads.get(x.thread) : null, w = whose(x.thread);
-    if (P.isPrivate(x.caption, w?.title, w?.cwd)) continue;
+    if (hidden.has(x.thread) || P.isPrivate(x.caption, w?.title, w?.cwd)) continue;
     const shots = x.shots.filter(inStore);
     if (!shots.length) continue;
     index.sets.push({ ...x, thread: t ? x.thread : null, shots, project: t ? P.of([t.title], t.cwd) : x.project });
@@ -422,7 +433,7 @@ function keepSeen(index, P) {
       continue;
     }
     const t = x.thread ? threads.get(x.thread) : null, w = whose(x.thread);
-    if (!versions.length || P.isPrivate(x.title, x.dir, w?.title, w?.cwd)) continue;
+    if (!versions.length || hidden.has(x.thread) || P.isPrivate(x.title, x.dir, w?.title, w?.cwd)) continue;
     index.pages.push({ ...x, thread: t ? x.thread : null, versions, at: versions[versions.length - 1].at });
     kept++;
   }
@@ -435,7 +446,7 @@ function keepSeen(index, P) {
     if (!fs.existsSync(path.join(EDITS, `${c.thread}.json`))) continue;
     index.changed.push(c);
   }
-  index.folders = [...new Set([...(index.folders || []), ...(prev.folders || [])])];
+  index.folders = [...new Set([...(index.folders || []), ...(prev.folders || []).filter((cwd) => !P.isPrivate(cwd))])];
   index.projects = { ...(prev.projects || {}), ...Object.fromEntries(P.names) };
   return kept;
 }
@@ -505,11 +516,17 @@ function keepEdits(edits, threads, P) {
 }
 
 export async function buildIndex({ log = () => {} } = {}) {
+  const scanStartedAt = Date.now();
   fs.mkdirSync(IMG, { recursive: true });
-  const P = projects();
-  const { threads, byCli } = readThreads(P);
+  let previous = null;
+  try { previous = JSON.parse(fs.readFileSync(path.join(DATA, "index.json"), "utf8")); } catch {}
+  const cfg = loadConfig();
+  const P = projects(cfg);
+  const hidden = new Set();
+  const { threads, byCli } = readThreads(P, hidden);
   const cliMeta = new Map(); // a session with no desktop record: what its transcript says
   const postThread = new Map(); // post id -> the thread that made it
+  const codexChildren = new Map();
   const sets = [];
   const pages = new Map(); // artifact id -> page
   const days = new Map(); // thread id -> { "YYYY-MM-DD": prompts }
@@ -595,6 +612,38 @@ export async function buildIndex({ log = () => {} } = {}) {
       if (!threads.has(threadId)) cliMeta.set(threadId, meta);
     }, (postId, session) => postThread.set(postId, own(session)), editsFor(threadId));
   }
+  const codex = await codexSessions(walk);
+  for (const session of codex.values()) {
+    let owner = session;
+    const ancestors = new Set();
+    while (codex.has(owner.parent) && !ancestors.has(owner.parent)) {
+      ancestors.add(owner.id);
+      owner = codex.get(owner.parent);
+    }
+    if (P.isPrivate(session.title, session.cwd, owner.title, owner.cwd)) {
+      hidden.add(session.id);
+      for (const post of session.posts) postThread.set(post, session.id);
+      continue;
+    }
+    byCli.set(session.id, owner.id);
+    if (session.id !== owner.id) {
+      const children = codexChildren.get(owner.id) || [];
+      children.push(session.id);
+      codexChildren.set(owner.id, children);
+    }
+    if (session.id === owner.id) {
+      cliMeta.set(owner.id, { ...owner, client: "codex" });
+      const counts = {};
+      for (const at of owner.prompts) {
+        const day = localDay(at);
+        counts[day] = (counts[day] || 0) + 1;
+      }
+      days.set(owner.id, counts);
+    }
+    for (const post of session.posts) postThread.set(post, owner.id);
+    const record = editsFor(owner.id);
+    for (const edit of session.edits) record(edit);
+  }
   repos.save();
 
   // Pages the tool hook caught as they were published (hooks/tool.mjs): one written by a script
@@ -608,26 +657,66 @@ export async function buildIndex({ log = () => {} } = {}) {
 
   // A post the tool hook tied to its session belongs to that session's thread (the desktop
   // thread it runs in, or the session itself), even before its transcript mentions it.
-  for (const p of readDir(POSTS)) if (p.session && !postThread.has(p.id)) postThread.set(p.id, byCli.get(p.session) || p.session);
+  const posts = readDir(POSTS).sort((a, b) => a.at - b.at);
+  // A skipped owner has no entry in the public index. Keep just the IDs and associations needed
+  // to continue excluding its posts if its local transcript is cleaned up between builds.
+  const privateHistoryFile = path.join(DATA, "private-history.json");
+  const rules = sha(JSON.stringify(cfg.private));
+  let privateHistory;
+  try { privateHistory = JSON.parse(fs.readFileSync(privateHistoryFile, "utf8")); } catch {}
+  if (privateHistory?.rules === rules) {
+    for (const id of privateHistory.sessions || []) {
+      if (!codex.has(id) && !cliMeta.has(id) && !threads.has(id) && !byCli.has(id)) hidden.add(id);
+    }
+    for (const [post, owner] of privateHistory.owners || []) {
+      if (hidden.has(owner) && !postThread.has(post)) postThread.set(post, owner);
+    }
+  }
+  const previousThreads = new Map((previous?.threads || []).map((t) => [t.id, t]));
+  const priorOwners = new Map((previous?.sets || []).filter((x) => x.thread).map((x) => [x.id, x.thread]));
+  const priorPages = new Map((previous?.pages || []).map((p) => [p.id, p]));
+  for (const p of posts) {
+    if (p.session && (p.client || !postThread.has(p.id))) postThread.set(p.id, byCli.get(p.session) || p.session);
+    if (!postThread.has(p.id)) {
+      const priorPage = p.page && priorPages.get(`post-${p.page.key}`);
+      const version = priorPage?.versions.find((v) => v.hash === p.page.hash && v.at === p.at);
+      const prior = priorOwners.get(p.id) || version?.thread || (priorPage?.versions.length === 1 && priorPage.thread);
+      if (prior) postThread.set(p.id, prior);
+    }
+  }
+  for (const t of previous?.threads || []) {
+    if (!cliMeta.has(t.id) && !threads.has(t.id) && P.isPrivate(t.title, t.cwd)) hidden.add(t.id);
+  }
 
   // A Claude Code session with no desktop record becomes a thread when it made something.
   let stored = [];
   try { stored = fs.readdirSync(EDITS).map((f) => f.replace(/\.json$/, "")); } catch {}
   const madeBy = new Set([...sets.map((s) => s.thread), ...[...pages.values()].map((p) => p.thread), ...postThread.values(), ...[...edits.values()].map((e) => e.thread), ...stored]);
   for (const [id, m] of cliMeta) {
-    if (threads.has(id) || !madeBy.has(id)) continue;
     const title = m.summary || m.title || path.basename(m.cwd || "") || "Session";
-    if (P.isPrivate(title, m.cwd)) continue;
-    threads.set(id, { id, title, cwd: m.cwd, archived: false, at: m.at, recap: "", cli: true });
+    if (P.isPrivate(title, m.cwd)) { hidden.add(id); continue; }
+    if (hidden.has(id) || threads.has(id) || !madeBy.has(id)) continue;
+    threads.set(id, { id, title, cwd: m.cwd, archived: !!m.archived, at: m.at, recap: "", cli: true, ...(m.client ? { client: m.client, native: true } : {}), ...(codexChildren.has(id) ? { clis: codexChildren.get(id) } : {}) });
   }
   // A post that names its session, when no transcript here knows that session (work brought in
   // from elsewhere, the demo), brings the session's name with it.
-  for (const p of readDir(POSTS)) {
+  const visiblePosts = posts.filter((p) => {
+    const owner = postThread.get(p.id);
+    const t = threads.get(owner);
+    return !hidden.has(owner) && !P.isPrivate(p.caption, p.cwd, p.topic, p.page?.title, p.sessionTitle, t?.title, t?.cwd);
+  });
+  for (const p of visiblePosts) {
     const id = postThread.get(p.id);
-    if (!id || !p.sessionTitle || P.isPrivate(p.sessionTitle, p.cwd)) continue;
+    if (!id) continue;
     const t = threads.get(id);
-    if (!t) threads.set(id, { id, title: p.sessionTitle, cwd: p.cwd || "", archived: false, at: p.at, recap: "", cli: true });
-    else if (t.cli && t.title === p.sessionTitle) t.at = Math.max(t.at, p.at);
+    if (!t && previousThreads.get(id)?.native) threads.set(id, { ...previousThreads.get(id), gone: true });
+    else if (!p.sessionTitle) continue;
+    else if (!t) threads.set(id, { id, title: p.sessionTitle, cwd: p.cwd || "", archived: false, at: p.at, recap: "", cli: true, ...(p.client ? { client: p.client } : {}) });
+    else if (t.cli) {
+      if (!t.native && !cliMeta.has(id) && p.at >= t.at) t.title = p.sessionTitle;
+      if (!t.client && p.client) t.client = p.client;
+      t.at = Math.max(t.at, p.at);
+    }
   }
   // sends from a session that turned out private, or unknown, leave the canvas
   for (let i = sets.length - 1; i >= 0; i--) {
@@ -637,7 +726,7 @@ export async function buildIndex({ log = () => {} } = {}) {
 
   // Posts made through the MCP server (screens, pages, pushed changes), and pushes the git hook
   // recorded on its own.
-  const posted = readPosts(P, threads, postThread, pages, sets);
+  readPosts(visiblePosts, P, threads, postThread, pages, sets);
 
   const out = [];
   for (const page of pages.values()) {
@@ -645,22 +734,25 @@ export async function buildIndex({ log = () => {} } = {}) {
     for (const v of page.versions) if (v.text == null && v.hash) try { v.text = fs.readFileSync(path.join(STORE, `${v.hash}.html`), "utf8"); } catch {}
     // The newest publish falls back to the file on disk when the transcript can't rebuild it.
     const last = page.versions[page.versions.length - 1];
-    if (last.text == null) {
+    if (last.text == null && page.filePath) {
       try { last.text = fs.readFileSync(page.filePath, "utf8"); } catch {}
     }
     const versions = [];
     for (const v of page.versions) {
       if (v.text == null) continue;
       const hash = sha(v.text);
-      if (versions.length && versions[versions.length - 1].hash === hash) continue;
+      if (versions.at(-1)?.hash === hash) {
+        if (page.posted) Object.assign(versions.at(-1), { thread: v.thread, at: v.at });
+        continue;
+      }
       const dest = path.join(STORE, `${hash}.html`);
       if (!fs.existsSync(dest)) fs.writeFileSync(dest, v.text);
-      versions.push({ at: v.at, hash });
+      versions.push({ at: v.at, hash, ...(page.posted ? { thread: v.thread } : {}) });
     }
     if (!versions.length) continue;
     const latestText = fs.readFileSync(path.join(STORE, `${versions[versions.length - 1].hash}.html`), "utf8");
     const thread = page.thread ? threads.get(page.thread) : null;
-    const title = page.title || titleOf(latestText) || path.basename(page.filePath, path.extname(page.filePath));
+    const title = page.title || titleOf(latestText) || (page.filePath && path.basename(page.filePath, path.extname(page.filePath))) || "Page";
     if (P.isPrivate(title, page.filePath, thread?.title, thread?.cwd)) continue;
     if (page.thread && !thread) page.thread = null;
     out.push({
@@ -670,7 +762,7 @@ export async function buildIndex({ log = () => {} } = {}) {
       thread: page.thread,
       project: page.project || P.of([title, page.filePath, thread?.title], thread?.cwd || page.cwd),
       at: versions[versions.length - 1].at,
-      dir: path.dirname(page.filePath),
+      dir: page.filePath ? path.dirname(page.filePath) : "",
       ...(page.posted ? { posted: true } : {}),
       ...(page.topic ? { topic: page.topic } : {}),
       versions,
@@ -683,10 +775,15 @@ export async function buildIndex({ log = () => {} } = {}) {
   const folders = [...new Set([...cliMeta.values(), ...threads.values()].map((m) => m.cwd).filter((c) => c && !P.isPrivate(c)))];
   const changed = keepEdits(edits, threads, P);
   try { fs.writeFileSync(AGENTS, JSON.stringify(agentsNow)); } catch {}
-  const index = { builtAt: Date.now(), projects: Object.fromEntries(P.names), threads: threadList, pages: out, sets, folders, changed };
-  const kept = keepSeen(index, P);
+  const index = { scanStartedAt, builtAt: Date.now(), projects: Object.fromEntries(P.names), threads: threadList, pages: out, sets, folders, changed };
+  const kept = keepSeen(index, P, hidden, previous);
   if (kept) log(`${kept} kept from earlier: their transcripts are gone`);
   filePostTopics(index); // a post that named its topic is filed under it now
+  const sessions = [...hidden];
+  const owners = [...postThread].filter(([, owner]) => hidden.has(owner));
+  const tmp = privateHistoryFile + "." + crypto.randomUUID();
+  fs.writeFileSync(tmp, JSON.stringify({ rules, sessions, owners }), { mode: 0o600 });
+  fs.renameSync(tmp, privateHistoryFile);
   fs.writeFileSync(path.join(DATA, "index.json"), JSON.stringify(index));
   log(`${out.length} pages, ${out.reduce((n, p) => n + p.versions.length, 0)} versions, ${sets.length} sets, ${sets.reduce((n, s) => n + s.shots.length, 0)} screens`);
   return index;

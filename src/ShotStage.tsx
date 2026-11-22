@@ -77,7 +77,7 @@ export function ShotStage({ opening, comments, gone, onComment, onStep, onClosin
     dialog.current?.focus({ preventScroll: true });
     return () => { requestAnimationFrame(() => { if (was?.isConnected && was !== document.body) was.focus({ preventScroll: true }); }); };
   }, []);
-  const notes = comments.filter((c) => c.page === shotKey(s));
+  const notes = comments.filter((c) => c.page === shotKey(s) && (c.set ? c.set === shots[i].set : !c.thread || c.thread === thread));
   // this screen's own size, worked out now rather than a render later, so it never shows at the
   // last screen's size; and which of the two is the larger, for the morph
   const own = fitRect(s);

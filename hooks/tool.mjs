@@ -21,7 +21,9 @@ try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
 const event = input.hook_event_name || "PostToolUse";
 const tool = String(input.tool_name || "");
 const cwd = input.cwd || process.cwd();
-const session = input.session_id || "";
+const rawSession = input.session_id || "";
+const codex = process.argv.includes("codex");
+const session = rawSession && codex ? `codex-${rawSession.toLowerCase()}` : rawSession;
 const say = (context) => process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 
 // ---- a post: bind it to this session --------------------------------------------------------
@@ -31,7 +33,10 @@ if (/(rounds|workbench)_(post|change)$/.test(tool) && event === "PostToolUse") {
   const file = id && path.join(POSTS, `${id}.json`);
   if (file && fs.existsSync(file) && session) {
     const post = JSON.parse(fs.readFileSync(file, "utf8"));
+    // Codex MCP metadata can identify a subagent more precisely than its parent's hook.
+    if (codex && post.session) process.exit(0);
     post.session = session;
+    if (codex) post.client = "codex";
     fs.writeFileSync(file, JSON.stringify(post, null, 1));
     fs.writeFileSync(path.join(DATA, "posted"), String(Date.now()));
   }

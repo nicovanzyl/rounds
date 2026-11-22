@@ -165,7 +165,7 @@ export function layout(index: Index, asOf: number | null = null, all = false, ev
           g.items.push({ kind: "shot", key: `${g.id}-${shot.hash}`, shot, before: s.before?.[k], set: s.id, thread: s.thread, w: shot.w, h: shot.h });
         });
         // a push recorded without screens: its commits, set like a page of notes
-        if (!s.shots.length && s.commits?.length) g.items.push({ kind: "note", key: `${g.id}-note-${s.id}`, title: s.caption, commits: s.commits, files: s.files || [], at: s.at, w: 520, h: 325 });
+        if (!s.shots.length && (s.commits?.length || s.kind === "change")) g.items.push({ kind: "note", key: `${g.id}-note-${s.id}`, title: s.caption, commits: s.commits || [], files: s.files || [], at: s.at, w: 520, h: 325 });
       }
     }
     // pages, each as it stood at the end of the day being shown
