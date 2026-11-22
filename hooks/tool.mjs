@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Claude Code hook for tools, run before and after them:
+// Claude Code and Codex hook for tool events:
 //
-// - After a Rounds post, the post is tied to the session that made it, at once (the hook is
-//   the one place that knows the session's id), so notes on it find their way back without
+// - After a Rounds post, a hook can supply the session ID when the MCP client omitted it,
+//   so notes on that post find their way back without
 //   waiting for the canvas to read transcripts again.
 // - After a page is published, a copy of it is kept, so it stays on the canvas after its file is
 //   gone.
@@ -21,18 +21,27 @@ try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
 const event = input.hook_event_name || "PostToolUse";
 const tool = String(input.tool_name || "");
 const cwd = input.cwd || process.cwd();
-const session = input.session_id || "";
+const rawSession = input.session_id || "";
+const codex = process.argv.includes("codex");
+const session = rawSession && codex ? `codex-${rawSession.toLowerCase()}` : rawSession;
 const say = (context) => process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } }));
 
 // ---- a post: bind it to this session --------------------------------------------------------
 if (/(rounds|workbench)_(post|change)$/.test(tool) && event === "PostToolUse") {
+  if (input.tool_response?.isError) process.exit(0);
   const said = JSON.stringify(input.tool_response || "");
-  const id = said.match(/\bpost ([a-f0-9]{16})\b/)?.[1];
+  const id = (said.match(/\bto (?:Rounds|Workbench) as post ([a-f0-9]{16})\b/i) || said.match(/\bpost ([a-f0-9]{16})\b/))?.[1];
   const file = id && path.join(POSTS, `${id}.json`);
   if (file && fs.existsSync(file) && session) {
     const post = JSON.parse(fs.readFileSync(file, "utf8"));
+    // A hook fills in missing ownership. MCP can identify a subagent more precisely
+    // and a response mentioning another post must never change that post's owner.
+    if (post.session || (post.client && post.client !== (codex ? "codex" : "claude"))) process.exit(0);
     post.session = session;
-    fs.writeFileSync(file, JSON.stringify(post, null, 1));
+    if (codex) post.client = "codex";
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(post, null, 1));
+    fs.renameSync(tmp, file);
     fs.writeFileSync(path.join(DATA, "posted"), String(Date.now()));
   }
   process.exit(0);

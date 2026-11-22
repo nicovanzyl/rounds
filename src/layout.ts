@@ -1,5 +1,5 @@
 import type { Commit, Index, Page, Shot, ShotSet, Thread, Topic } from "./data";
-import { clean } from "./data";
+import { clean, versionOwner } from "./data";
 import { dayKey } from "./days";
 
 // The canvas as an atlas. Each project is a column: its name, its days of activity, then
@@ -33,7 +33,7 @@ export type Item =
   | { kind: "shot"; key: string; shot: Shot; before?: Shot; set: string; thread: string | null; w: number; h: number }
   | { kind: "note"; key: string; title: string; commits: Commit[]; files: string[]; at: number; w: number; h: number }
   | { kind: "files"; key: string; thread: string; title: string; rows: FileRow[]; w: number; h: number }
-  | { kind: "page"; key: string; page: Page; hash: string; layers: number; w: number; h: number };
+  | { kind: "page"; key: string; page: Page; hash: string; versionIndex: number; layers: number; w: number; h: number };
 export type PlacedItem = Item & { x: number; y: number; dw: number; dh: number; more?: number };
 export type Group = {
   id: string;
@@ -137,9 +137,10 @@ export function layout(index: Index, asOf: number | null = null, all = false, ev
   // holds yet stays its own sitting, merged with sends from its thread close in time.
   type G = { id: string; thread: string | null; first: number; last: number; caption: string; topic: boolean; sets: ShotSet[]; items: Item[] };
 
+  const pinnedSets = new Set(index.comments?.map(c => c.set).filter(Boolean));
   const proj = Object.keys(index.projects).map((key) => {
     const topicOf = new Map<string, Topic>();
-    for (const t of index.topics?.[key] || []) for (const id of t.sets) topicOf.set(id, t);
+    for (const t of (index.topics && Object.hasOwn(index.topics, key) ? index.topics[key] : [])) for (const id of t.sets) topicOf.set(id, t);
     const gs: G[] = [];
     const byTopic = new Map<string, G>();
     for (const s of index.sets) {
@@ -160,12 +161,13 @@ export function layout(index: Index, asOf: number | null = null, all = false, ev
       const seen = new Set<string>();
       for (const s of [...g.sets].sort((a, b) => b.at - a.at)) {
         s.shots.forEach((shot, k) => {
-          if (seen.has(shot.hash)) return;
-          seen.add(shot.hash);
-          g.items.push({ kind: "shot", key: `${g.id}-${shot.hash}`, shot, before: s.before?.[k], set: s.id, thread: s.thread, w: shot.w, h: shot.h });
+          const key = `${s.thread || ""}/${shot.hash}`;
+          if (seen.has(key) && !pinnedSets.has(s.id)) return;
+          seen.add(key);
+          g.items.push({ kind: "shot", key: `${g.id}-${s.id}-${k}`, shot, before: s.before?.[k], set: s.id, thread: s.thread, w: shot.w, h: shot.h });
         });
         // a push recorded without screens: its commits, set like a page of notes
-        if (!s.shots.length && s.commits?.length) g.items.push({ kind: "note", key: `${g.id}-note-${s.id}`, title: s.caption, commits: s.commits, files: s.files || [], at: s.at, w: 520, h: 325 });
+        if (!s.shots.length && (s.commits?.length || s.kind === "change")) g.items.push({ kind: "note", key: `${g.id}-note-${s.id}`, title: s.caption, commits: s.commits || [], files: s.files || [], at: s.at, w: 520, h: 325 });
       }
     }
     // pages, each as it stood at the end of the day being shown
@@ -175,12 +177,13 @@ export function layout(index: Index, asOf: number | null = null, all = false, ev
       if (!shown.length) continue;
       const v = shown[shown.length - 1];
       if (v.at < start) continue;
-      const item: Item = { kind: "page", key: `page-${page.id}`, page, hash: v.hash, layers: Math.min(2, shown.length - 1), w: 1280, h: 800 };
+      const owner = versionOwner(page, v);
+      const item: Item = { kind: "page", key: `page-${page.id}`, page, hash: v.hash, versionIndex: page.versions.indexOf(v), layers: Math.min(2, shown.length - 1), w: 1280, h: 800 };
       // a page posted under a topic joins it; otherwise the sitting its thread was in
       const named = page.topic && gs.find((g) => g.topic && g.caption.toLowerCase() === page.topic!.toLowerCase());
-      const home = named || (page.thread && gs.find((g) => g.sets.some((s) => s.thread === page.thread && Math.abs(s.at - v.at) < JOIN)));
+      const home = named || (owner && gs.find((g) => g.sets.some((s) => s.thread === owner && Math.abs(s.at - v.at) < JOIN)));
       if (home) { home.items.unshift(item); home.last = Math.max(home.last, v.at); }
-      else gs.push({ id: `p-${page.id}`, thread: page.thread, first: v.at, last: v.at, caption: page.topic || page.title, topic: true, sets: [], items: [item] });
+      else gs.push({ id: `p-${page.id}`, thread: owner, first: v.at, last: v.at, caption: page.topic || page.title, topic: true, sets: [], items: [item] });
     }
     gs.sort((a, b) => b.last - a.last);
     return { key, groups: all ? gs : gs.slice(0, GROUPS_PER_PROJECT) };

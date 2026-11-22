@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { reducedTransparency } from "./look";
-import { clean, loadIndex, readSeen, markSeen, type Index, type Page } from "./data";
+import { clean, versionOwner, loadIndex, readSeen, markSeen, type Index, type Page } from "./data";
 import { layout, type Cluster, type Group } from "./layout";
 import { useCamera, fit, type Cam } from "./camera";
 import { spring } from "./motion";
@@ -80,7 +80,7 @@ export default function App() {
   const [searching, setSearching] = useState(false);
   const [lit, setLit] = useState<string | null>(null);
   // one session, picked in search: the canvas and the timeline show only what it made, all of it
-  const [chat, setChat] = useState<string | null>(null);
+  const [chat, setChat] = useState<string | null>(() => new URLSearchParams(location.search).get("session"));
   // after the canvas re-forms for a session (or for everything again): where the camera lands
   const refit = useRef<{ to: "session" | "all"; find?: string } | null>(null);
   const finding = useRef<{ id: string; at: number; back: boolean; still?: boolean } | null>(null);
@@ -153,7 +153,10 @@ export default function App() {
     ...index,
     threads: index.threads.filter((t) => t.id === chat),
     sets: index.sets.filter((s) => s.thread === chat),
-    pages: index.pages.filter((p) => p.thread === chat),
+    pages: index.pages.flatMap(p => {
+      const versions = p.versions.filter(v => versionOwner(p, v) === chat);
+      return versions.length ? [{ ...p, thread: chat, at: versions[versions.length - 1].at, versions }] : [];
+    }),
     changed: index.changed?.filter((c) => c.thread === chat),
   }), [index, chat]);
   const world = useMemo(() => (shown && index ? layout(shown, asOf, !!chat, index) : null), [shown, index, asOf, chat]);
@@ -487,15 +490,15 @@ export default function App() {
     camera.glide(framed(c));
   };
 
-  const openPage = (page: Page, el: HTMLElement, hash?: string) => {
+  const openPage = (page: Page, el: HTMLElement, versionIndex: number) => {
     const r = el.getBoundingClientRect();
     setFocus(null);
-    setOpen({ page, from: { x: r.left, y: r.top, w: r.width, h: r.height }, hash, place: tool === "comment" });
+    setOpen({ page, from: { x: r.left, y: r.top, w: r.width, h: r.height }, versionIndex, place: tool === "comment" });
     setSeen(markSeen(page.id));
   };
   const openItem = (g: Group, i: number, el: HTMLElement) => {
     const it = g.items[i];
-    if (it.kind === "page") return openPage(it.page, el, it.hash);
+    if (it.kind === "page") return openPage(it.page, el, it.versionIndex);
     const r = el.getBoundingClientRect();
     setFocus(null);
     setShotKey(it.key);
@@ -523,6 +526,10 @@ export default function App() {
     reform(!!id);
     refit.current = id ? { to: "session", find } : { to: "all" };
     touched.current = true;
+    const url = new URL(location.href);
+    if (id) url.searchParams.set("session", id);
+    else url.searchParams.delete("session");
+    history.replaceState(history.state, "", url);
     setChat(id);
     if (!find) setAsOf(null);
   };
@@ -748,7 +755,7 @@ export default function App() {
   const onFile = useCallback((sheet: FilesSheet, i: number, el: HTMLElement) => { if (!latest.current.suppressClick()) latest.current.openFile(sheet, i, el); }, []);
   const onSession = useCallback((id: string) => { if (!latest.current.suppressClick()) latest.current.showSession(id); }, []);
 
-  const noted = useMemo(() => new Set((index?.comments ?? []).map((c) => c.page)), [index]);
+  const noted = useMemo(() => new Set((index?.comments ?? []).map((c) => c.set ? `${c.set}/${c.page}` : c.page)), [index]);
   const gone = useMemo(() => new Set((index?.threads ?? []).filter((t) => t.gone).map((t) => t.id)), [index]);
   // Tab walks the canvas: the camera brings what has focus into view. The window itself never
   // scrolls; a focused card off screen would otherwise shift the whole canvas and leave it there.

@@ -81,7 +81,7 @@ function claude(prompt, resume) {
 const empty = path.join(T, "no-transcripts");
 fs.mkdirSync(path.join(empty, "projects"), { recursive: true });
 const server = spawn("node", ["-e", `import(${JSON.stringify(path.join(ROOT, "server/serve.mjs"))}).then((m) => m.serve(${PORT}))`],
-  { env: { ...env, ROUNDS_CLAUDE_HOME: empty, ROUNDS_DESKTOP_SESSIONS: empty }, stdio: "ignore" });
+  { env: { ...env, ROUNDS_CLAUDE_HOME: empty, ROUNDS_CODEX_HOME: empty, ROUNDS_DESKTOP_SESSIONS: empty }, stdio: "ignore" });
 const api = async (p, body) => {
   for (let i = 0; i < 60; i++) {
     try { const r = await fetch(`http://127.0.0.1:${PORT}${p}`, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}); return await r.json(); }

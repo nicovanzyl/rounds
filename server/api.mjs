@@ -11,6 +11,8 @@ import { buildIndex, keepImage, hasSips, which, DATA, STORE, IMG } from "./index
 import { pastPushes, importPushes } from "./history.mjs";
 import { applyMoves, fileTopics, filePostTopics, loadTopics } from "./topics.mjs";
 import { POSTS, projects, loadConfig } from "./config.mjs";
+import { SNAPSHOT_MARK } from "./remote-content.mjs";
+import { updateComments } from "./comments-store.mjs";
 import { watchReleases, versionState, runUpdate, handOver } from "./updates.mjs";
 
 const SHOTS = path.join(DATA, "shots");
@@ -167,21 +169,48 @@ const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8"))
 // keeps the note on the canvas, and the pin says so.
 // The relay is opt-in ("relay": true in config); without it a desktop thread's note goes by the
 // hook like any other.
-const route = (t) => (!t ? "kept" : t.startsWith("local_") && loadConfig().relay ? "relay" : "hook");
+function route(thread) {
+  if (!thread) return "kept";
+  if (thread.startsWith("mcp-") || thread.startsWith("codex-")) return "mcp";
+  return thread.startsWith("local_") && loadConfig().relay ? "relay" : "hook";
+}
+
+const versionOwner = (page, version) => version.thread === undefined ? page.thread : version.thread;
 
 // Every note with where it goes, said plainly on its pin. A note pinned before the canvas knew
 // whose post it was finds its session once the tool hook has tied the post to it; the notes
 // hook delivers those, so they go by the hook.
-function comments(idx) {
+async function comments(idx) {
   const list = readJSON(COMMENTS, []);
-  idx ||= withLivePosts(readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] }));
+  idx ||= await withLivePosts(readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] }));
   const threads = new Map((idx.threads || []).map((t) => [t.id, t]));
+  const aliases = new Map([...threads.values()].flatMap(t => (t.clis || []).map(cli => [cli, t.id])));
+  const hidden = new Set(readJSON(path.join(DATA, "private-history.json"), {}).sessions || []);
+  const added = readJSON(ADDED, { sets: [], pages: [] });
+  const pages = new Map([...idx.pages, ...added.pages].map(p => [p.id, p]));
+  const shots = new Map();
+  for (const set of [...idx.sets, ...added.sets]) for (const { hash } of set.shots) {
+    if (!shots.has(hash)) shots.set(hash, []);
+    shots.get(hash).push(set);
+  }
+  const visible = [];
   for (const c of list) {
-    if (!c.thread) {
-      const made = (idx.sets || []).find((x) => x.thread && x.shots.some((s) => s.hash === c.hash))
-        || (idx.pages || []).find((x) => x.thread && x.versions.some((v) => v.hash === c.hash));
-      if (made) Object.assign(c, { thread: made.thread, state: "queued", route: "hook" });
+    if (hidden.has(c.thread)) continue;
+    c.thread = aliases.get(c.thread) || c.thread;
+    if (hidden.has(c.thread)) continue;
+    let owners;
+    if (c.page === `shot-${c.hash}`) {
+      const candidates = (shots.get(c.hash) || []).filter(s => !c.set || s.id === c.set);
+      owners = candidates.map(s => s.thread);
+    } else {
+      const page = pages.get(c.page);
+      owners = page?.versions.filter(v => v.hash === c.hash).map(v => versionOwner(page, v)) || [];
     }
+    if (!owners.length || (c.thread && !owners.includes(c.thread))) continue;
+    if (!c.thread && owners[0] && owners.every(owner => owner === owners[0])) {
+      Object.assign(c, { thread: owners[0], state: "queued", route: route(owners[0]) });
+    }
+    visible.push(c);
     c.route ||= route(c.thread);
     c.threadTitle ||= threads.get(c.thread)?.title || null;
     // a note still waiting when its session left this Mac will never be heard: it stays here
@@ -190,34 +219,69 @@ function comments(idx) {
     const s = readJSON(path.join(SENT, `${c.id}.json`), null);
     if (s) Object.assign(c, { state: "sent", delivery: s.delivery || "delivered" });
   }
-  return list;
+  return visible;
 }
 
 // Posts that landed since the last index show at once; the next index ties them to their thread.
-function withLivePosts(idx) {
+async function withLivePosts(idx) {
   let posts = [];
-  try { posts = fs.readdirSync(POSTS).map((f) => readJSON(path.join(POSTS, f), null)).filter(Boolean).sort((a, b) => a.at - b.at); } catch {}
+  try { posts = fs.readdirSync(POSTS).filter((f) => f.endsWith(".json")).map((f) => readJSON(path.join(POSTS, f), null)).filter(Boolean).sort((a, b) => a.at - b.at); } catch {}
   if (!posts.length) return idx;
   const P = projects();
-  const byId = new Map(posts.map((p) => [p.id, p]));
-  const have = new Set(idx.sets.map((s) => s.id));
-  const pageHave = new Set(idx.pages.flatMap((p) => p.versions.map((v) => v.hash)));
+  const sets = new Map(idx.sets.map((s) => [s.id, s]));
+  const pages = new Map(idx.pages.map(p => [p.id, p]));
+  const hidden = new Set(readJSON(path.join(DATA, "private-history.json"), {}).sessions || []);
   // the session a post was made in (the tool hook records it): its desktop thread, or itself
-  const threadOf = (s) => (s && (idx.threads.find((t) => t.id === s || (t.clis || []).includes(s))?.id || s)) || null;
-  for (const s of idx.sets) if (!s.thread && byId.get(s.id)?.session) s.thread = threadOf(byId.get(s.id).session);
+  const threads = new Map();
+  for (const t of idx.threads) {
+    threads.set(t.id, t);
+    for (const cli of t.clis || []) threads.set(cli, t);
+  }
   for (const p of posts) {
-    // what the config keeps private stays off the canvas, posted or not (the indexer skips it too)
-    if (P.isPrivate(p.caption, p.cwd, p.topic, p.sessionTitle, p.page?.title)) continue;
-    const project = P.of([p.caption], p.cwd);
-    if (p.shots?.length && !have.has(p.id)) {
-      const before = p.before?.length ? p.before : (p.replaces && byId.get(p.replaces)?.shots) || [];
-      idx.sets.push({ id: p.id, thread: threadOf(p.session), project, at: p.at, caption: p.caption, topic: p.topic, kind: p.kind, shots: p.shots, ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}) });
+    let owner = threads.get(p.session);
+    const thread = owner?.id || p.session || null;
+    const page = p.page && pages.get(`post-${p.page.key}`);
+    if (hidden.has(p.session) || hidden.has(thread) || P.isPrivate(p.caption, p.cwd, p.topic, p.sessionTitle, p.page?.title, owner?.title, owner?.cwd)) {
+      // An anonymous post may already be cached when a hook identifies a private author.
+      if (sets.has(p.id) || page?.versions.some(v => v.at === p.at && v.hash === p.page.hash)) return reindex();
+      continue;
     }
-    if (p.page && !pageHave.has(p.page.hash)) {
+    // A tool hook can bind a post after a full index. Update its exact indexed
+    // revision before skipping older posts, so an early pin reaches its author.
+    const existingSet = sets.get(p.id);
+    if (existingSet && !existingSet.thread && thread) existingSet.thread = thread;
+    const indexedVersion = thread && page?.versions.find(v => v.at === p.at && v.hash === p.page.hash && !v.thread);
+    if (indexedVersion) {
+      indexedVersion.thread = thread;
+      if (indexedVersion === page.versions.at(-1)) page.thread = thread;
+    }
+    if (p.at < (idx.scanStartedAt ?? idx.builtAt)) continue;
+    const project = owner ? owner.project : P.of([p.sessionTitle || p.caption], p.cwd);
+    if (!owner && thread && p.sessionTitle) {
+      owner = { id: thread, title: p.sessionTitle, cwd: p.cwd || "", archived: false, at: p.at, recap: "", project, cli: true, days: {}, client: p.client };
+      idx.threads.push(owner);
+      threads.set(thread, owner);
+    }
+    if ((p.shots?.length || p.kind === "change") && !sets.has(p.id)) {
+      const before = p.before?.length ? p.before : sets.get(p.replaces)?.shots || [];
+      const set = { id: p.id, thread, project, at: p.at, caption: p.caption, topic: p.topic, kind: p.kind, shots: p.shots || [], ...(before.length ? { before } : {}), ...(p.commits ? { commits: p.commits } : {}) };
+      idx.sets.push(set);
+      sets.set(set.id, set);
+    }
+    if (p.page) {
       const id = `post-${p.page.key}`;
-      let pg = idx.pages.find((x) => x.id === id);
-      if (!pg) idx.pages.push((pg = { id, url: "", title: p.page.title, thread: threadOf(p.session), project, at: p.at, dir: path.dirname(p.page.path), versions: [], posted: true }));
-      pg.versions.push({ at: p.at, hash: p.page.hash });
+      let pg = pages.get(id);
+      if (!pg) {
+        pg = { id, url: "", project, dir: p.page.path ? path.dirname(p.page.path) : null, versions: [], posted: true };
+        idx.pages.push(pg);
+        pages.set(id, pg);
+      }
+      if (pg.at > p.at || pg.versions.some(v => v.at === p.at && v.hash === p.page.hash && versionOwner(pg, v) === thread)) continue;
+      const last = pg.versions.at(-1);
+      if (last?.hash === p.page.hash && versionOwner(pg, last) === thread) last.at = p.at;
+      else pg.versions.push({ at: p.at, hash: p.page.hash, thread });
+      pg.title = p.page.title;
+      pg.thread = thread;
       pg.at = p.at;
       if (p.topic) pg.topic = p.topic;
     }
@@ -225,6 +289,12 @@ function withLivePosts(idx) {
   idx.projects = { ...idx.projects, ...Object.fromEntries(P.names) };
   filePostTopics(idx);
   return idx;
+}
+
+// Local pages can request their relative assets as soon as their MCP post appears.
+async function findPage(matches) {
+  const idx = readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] });
+  return idx.pages.find(matches) || (await withLivePosts(idx)).pages.find(matches);
 }
 
 let indexing = null;
@@ -294,20 +364,23 @@ export async function handle(req, res, next) {
             let idx = readJSON(path.join(DATA, "index.json"), null);
             if (!idx || url.searchParams.has("fresh")) idx = await reindex();
             else if (Date.now() - idx.builtAt > 10 * 60e3) reindex();
-            withLivePosts(idx);
+            idx = await withLivePosts(idx);
             const added = readJSON(ADDED, { sets: [], pages: [] });
             const topics = loadTopics();
             const all = applyMoves({ ...idx, sets: [...(idx.sets || []), ...added.sets] }, topics);
             // previews: whether page previews (and the page compare drawn from them) can be made here
-            return json(res, { ...all, pages: [...idx.pages, ...added.pages], topics: topics.projects, comments: comments(idx), previews: !!previews() });
+            return json(res, { ...all, pages: [...idx.pages, ...added.pages], topics: topics.projects, comments: await comments(idx), previews: !!previews() });
           }
-          if (p === "/api/comments" && req.method === "GET") return json(res, comments());
+          if (p === "/api/comments" && req.method === "GET") return json(res, await comments());
           // one session's changes to one file, in order: /api/edits/<thread>?repo=…&file=…
           if (p.startsWith("/api/edits/")) {
             const thread = decodeURIComponent(p.slice("/api/edits/".length));
             if (!/^[\w-]+$/.test(thread)) return json(res, { error: "bad" }, 400);
+            const repo = url.searchParams.get("repo"), file = url.searchParams.get("file");
+            const idx = readJSON(path.join(DATA, "index.json"), {});
+            if (!idx.changed?.some(c => c.thread === thread && c.repo === repo && c.file === file)) return json(res, []);
             const all = readJSON(path.join(STORE, "edits", `${thread}.json`), {});
-            return json(res, all[`${url.searchParams.get("repo")}\n${url.searchParams.get("file")}`] || []);
+            return json(res, all[`${repo}\n${file}`] || []);
           }
           // An empty canvas offers the last 30 days of pushes to main from the repos the sessions
           // worked in (server/history.mjs); bringing them in writes push records and indexes again.
@@ -372,25 +445,25 @@ export async function handle(req, res, next) {
           if (p === "/api/comments" && req.method === "POST") {
             const c = await body(req);
             // the canvas as it shows now: posts that just landed, tied to their sessions
-            const idx = withLivePosts(readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] }));
+            const idx = await withLivePosts(readJSON(path.join(DATA, "index.json"), { pages: [], threads: [], sets: [] }));
             const added = readJSON(ADDED, { sets: [], pages: [] });
             idx.sets = [...idx.sets, ...added.sets];
             idx.pages = [...idx.pages, ...added.pages];
             // a pin on a screen goes to the thread that showed it to him
             if (typeof c.page === "string" && c.page.startsWith("shot-")) {
-              const set = (idx.sets || []).find((x) => x.id === c.set && x.shots.some((s) => s.hash === c.hash))
-                || (idx.sets || []).find((x) => x.shots.some((s) => s.hash === c.hash));
+              const candidates = idx.sets.filter(x => (!c.set || x.id === c.set) && x.shots.some(s => s.hash === c.hash));
+              const set = candidates.length === 1 ? candidates[0] : null;
               const sh = set?.shots.find((s) => s.hash === c.hash);
-              if (!set || !sh || !c.text?.trim()) return json(res, { error: "bad" }, 400);
+              if (c.page !== `shot-${c.hash}` || !set || !sh || !c.text?.trim()) return json(res, { error: "bad" }, 400);
               const thread = idx.threads.find((t) => t.id === set.thread);
               // a session no longer on this Mac can't hear it: the note stays on the canvas
               const to = thread?.gone ? null : set.thread;
               const comment = {
-                id: crypto.randomUUID().slice(0, 8), page: c.page, hash: c.hash, x: c.x, y: c.y,
+                id: crypto.randomUUID(), page: c.page, set: set.id, hash: c.hash, x: c.x, y: c.y,
                 text: c.text.trim(), at: Date.now(), thread: set.thread || null, state: to ? "queued" : "kept",
                 route: route(to), threadTitle: thread?.title || null,
               };
-              fs.writeFileSync(COMMENTS, JSON.stringify([...readJSON(COMMENTS, []), comment], null, 1));
+              await updateComments((list) => list.push(comment));
               if (comment.route === "relay") {
                 fs.writeFileSync(path.join(INBOX, `${comment.id}.json`), JSON.stringify({
                   ...comment,
@@ -405,22 +478,25 @@ export async function handle(req, res, next) {
               return json(res, comment);
             }
             const page = idx.pages.find((x) => x.id === c.page);
-            if (!page || !c.text?.trim()) return json(res, { error: "bad" }, 400);
-            const thread = idx.threads.find((t) => t.id === page.thread);
-            const to = thread?.gone ? null : page.thread;
+            const versions = page?.versions.filter(v => v.hash === c.hash) || [];
+            const owners = new Set(versions.map(v => versionOwner(page, v)));
+            const owner = "versionThread" in c ? c.versionThread : owners.size === 1 ? owners.values().next().value : undefined;
+            if (owner === undefined || !owners.has(owner) || !c.text?.trim()) return json(res, { error: "Unknown or ambiguous page revision" }, 400);
+            const thread = idx.threads.find((t) => t.id === owner);
+            const to = thread?.gone ? null : owner;
             const comment = {
-              id: crypto.randomUUID().slice(0, 8),
+              id: crypto.randomUUID(),
               page: page.id,
               hash: c.hash,
               x: c.x, y: c.y,
               text: c.text.trim(),
               at: Date.now(),
-              thread: page.thread || null,
+              thread: owner || null,
               state: to ? "queued" : "kept",
               route: route(to),
               threadTitle: thread?.title || null,
             };
-            fs.writeFileSync(COMMENTS, JSON.stringify([...readJSON(COMMENTS, []), comment], null, 1));
+            await updateComments((list) => list.push(comment));
             if (comment.route === "relay") {
               fs.writeFileSync(path.join(INBOX, `${comment.id}.json`), JSON.stringify({
                 ...comment,
@@ -438,19 +514,22 @@ export async function handle(req, res, next) {
           if ((m = p.match(/^\/api\/page\/([0-9a-f]{16})$/))) {
             const f = path.join(STORE, `${m[1]}.html`);
             if (!fs.existsSync(f)) return json(res, { error: "missing" }, 404);
-            const idx = readJSON(path.join(DATA, "index.json"), { pages: [] });
-            const page = idx.pages.find((x) => x.versions.some((v) => v.hash === m[1]));
             let html = fs.readFileSync(f, "utf8");
-            if (page?.dir && fs.existsSync(page.dir) && !/<base\s/i.test(html)) {
-              const base = `<base href="/api/asset/${page.id}/">`;
-              html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (h) => h + base) : base + html;
+            if (html.startsWith(SNAPSHOT_MARK)) {
+              res.setHeader("Content-Security-Policy", "sandbox allow-same-origin; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none'");
+              res.setHeader("Referrer-Policy", "no-referrer");
+            } else if (!/<base\s/i.test(html)) {
+              const page = await findPage(x => x.versions.some(v => v.hash === m[1]));
+              if (page?.dir && fs.existsSync(page.dir)) {
+                const base = `<base href="/api/asset/${page.id}/">`;
+                html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, h => h + base) : base + html;
+              }
             }
             res.setHeader("content-type", "text/html; charset=utf-8");
             return res.end(html);
           }
           if ((m = p.match(/^\/api\/asset\/([A-Za-z0-9-]+)\/(.+)$/))) {
-            const idx = readJSON(path.join(DATA, "index.json"), { pages: [] });
-            const page = idx.pages.find((x) => x.id === m[1]);
+            const page = await findPage(x => x.id === m[1]);
             if (!page?.dir) return json(res, { error: "missing" }, 404);
             const f = path.resolve(page.dir, decodeURIComponent(m[2]));
             if (!f.startsWith(path.resolve(page.dir) + path.sep) || !fs.existsSync(f) || !fs.statSync(f).isFile()) return json(res, { error: "missing" }, 404);

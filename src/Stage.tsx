@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { clean, pageSrc, postComment, shot, thumb, threadLink, when, type Comment, type Index, type Page } from "./data";
+import { clean, versionOwner, pageSrc, postComment, shot, thumb, threadLink, when, type Comment, type Index, type Page } from "./data";
 import { diffBoxes, type Box } from "./diff";
 import { blockChanges, type Changes } from "./blocks";
 import { Glyph } from "./glyphs";
@@ -7,7 +7,7 @@ import { reducedMotion } from "./look";
 import { closeEase } from "./motion";
 
 export type Rect = { x: number; y: number; w: number; h: number };
-export type Opening = { page: Page; from: Rect; hash?: string; place?: boolean };
+export type Opening = { page: Page; from: Rect; versionIndex: number; place?: boolean };
 
 const PAGE_W = 1280; // pages render at desktop width and scale to the stage
 
@@ -22,7 +22,7 @@ export function Stage({ opening, index, onComment, onClosing, onClose }: {
 }) {
   const { page, from } = opening;
   const versions = page.versions;
-  const [vi, setVi] = useState(() => { const i = versions.findIndex((v) => v.hash === opening.hash); return i >= 0 ? i : versions.length - 1; });
+  const [vi, setVi] = useState(opening.versionIndex);
   // the compare is drawn from page previews: with none on this machine, a page opens live
   const canPreview = index.previews !== false;
   const [changes, setChanges] = useState(versions.length > 1 && canPreview);
@@ -35,9 +35,9 @@ export function Stage({ opening, index, onComment, onClosing, onClose }: {
   const notes = useMemo(() => index.comments.filter((c) => c.page === page.id), [index.comments, page.id]);
   const [rect, setRect] = useState(target);
   const box = useRef<HTMLDivElement>(null);
-  const thread = index.threads.find((t) => t.id === page.thread);
-
   const v = versions[vi];
+  const owner = versionOwner(page, v);
+  const thread = index.threads.find((t) => t.id === owner);
   const prev = vi > 0 ? versions[vi - 1] : null;
   const showChanges = changes && !!prev;
   const scale = rect.w / PAGE_W;
@@ -111,7 +111,7 @@ export function Stage({ opening, index, onComment, onClosing, onClose }: {
 
   const send = async (text: string) => {
     if (!draft) return;
-    const c = await postComment({ page: page.id, hash: v.hash, x: draft.x, y: draft.y, text });
+    const c = await postComment({ page: page.id, hash: v.hash, versionThread: owner, x: draft.x, y: draft.y, text });
     onComment(c);
     setDraft(null);
     setPlacing(false);
@@ -365,6 +365,7 @@ function whereTo(note: Comment) {
   if (note.state === "sent") return `Sent to ${to}`;
   if (note.state === "kept" || note.route === "kept") return note.thread ? "Stays here: its session is no longer on this Mac" : "Stays here: no session made this";
   if (note.route === "relay") return `On its way to ${to}`;
+  if (note.route === "mcp") return `Available when ${to} checks Rounds`;
   return `Goes to ${to} with your next message there`;
 }
 

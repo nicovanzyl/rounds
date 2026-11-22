@@ -114,7 +114,7 @@ export const ClusterView = memo(function ClusterView({ c, cap, far, near, live, 
               ? <Note key={it.key} it={it} far={far} />
               : it.kind === "files"
               ? <Files key={it.key} it={it} far={far} onFile={onFile} onSession={onSession} />
-              : <Screen key={it.key} it={it} far={far} near={near} live={lit.has(g.id)} hidden={openKey === it.key} noted={noted.has(it.kind === "page" ? it.page.id : `shot-${it.shot.hash}`)} fresh={it.kind === "page" && fresh.has(it.page.id)} label={g.title} onOpen={(el) => onOpen(g, i, el)} />
+              : <Screen key={it.key} it={it} far={far} near={near} live={lit.has(g.id)} hidden={openKey === it.key} noted={it.kind === "page" ? noted.has(it.page.id) : noted.has(`${it.set}/shot-${it.shot.hash}`) || noted.has(`shot-${it.shot.hash}`)} fresh={it.kind === "page" && fresh.has(it.page.id)} label={g.title} onOpen={(el) => onOpen(g, i, el)} />
           ))}
         </Layer>
       ))}

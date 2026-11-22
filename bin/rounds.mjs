@@ -7,7 +7,7 @@
 // rounds check        ask GitHub for the latest release now (the notes hook runs it once a day)
 // rounds uninstall    take out what init put in (your canvas data stays)
 // rounds index        read every transcript again
-// rounds mcp          the MCP server, for Claude (stdio)
+// rounds mcp          the MCP server (stdio); --content-only for remote clients
 // rounds hook <notes|tool|git-push>   the hooks, for Claude and git
 import fs from "node:fs";
 import path from "node:path";
@@ -23,7 +23,10 @@ if (Number(process.versions.node.split(".")[0]) < 20) { say(`Rounds needs Node 2
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // the command is the first word that isn't a flag; flags can come anywhere
 const argv = process.argv.slice(2);
-const cmd = argv.find((a) => !a.startsWith("-"));
+const clientFlag = argv.indexOf("--client");
+const selected = clientFlag >= 0 ? argv[clientFlag + 1] : argv.find((arg) => arg.startsWith("--client="))?.slice(9);
+const client = selected ?? "claude";
+const cmd = argv.find((arg, i) => !arg.startsWith("-") && !(clientFlag >= 0 && i === clientFlag + 1));
 const rest = argv.filter((a) => a !== cmd);
 const yes = rest.includes("--yes") || rest.includes("-y");
 // run through npx, this copy lives in npx's cache, which gets cleared
@@ -58,14 +61,14 @@ function copyApp(home) {
   fs.rmSync(old, { recursive: true, force: true });
 }
 async function update({ quiet = false } = {}) {
-  const { DATA, CLAUDE } = await import("../server/config.mjs");
+  const { DATA } = await import("../server/config.mjs");
   const home = path.join(DATA, "app");
   if (!fromNpx || !fs.existsSync(home)) { if (!quiet) say(fromNpx ? "Rounds isn't set up here yet. Run init first." : "This copy of Rounds runs where it is; pull the repo to update it."); return; }
   if (fingerprint(ROOT) === fingerprint(home)) { if (!quiet) say("Rounds is up to date."); return; }
   copyApp(home);
-  const skill = path.join(CLAUDE, "skills", "rounds", "SKILL.md");
-  if (fs.existsSync(skill)) fs.copyFileSync(path.join(home, "skill", "SKILL.md"), skill);
-  say(`Claude sessions you start from now on use Rounds ${JSON.parse(fs.readFileSync(path.join(home, "package.json"), "utf8")).version}.`);
+  const { installSkill } = await import("./setup.mjs");
+  for (const client of ["claude", "codex"]) installSkill(home, client, true);
+  say(`Sessions you start from now on use Rounds ${JSON.parse(fs.readFileSync(path.join(home, "package.json"), "utf8")).version}.`);
 }
 
 if (rest.includes("--demo")) {
@@ -104,7 +107,7 @@ if (rest.includes("--demo")) {
   }
   const empty = path.join(demo, ".empty");
   fs.mkdirSync(path.join(empty, "projects"), { recursive: true });
-  for (const [k, v] of Object.entries({ HOME: demo, CLAUDE_HOME: empty, DESKTOP_SESSIONS: empty })) process.env[`ROUNDS_${k}`] = process.env[`WORKBENCH_${k}`] = v;
+  for (const [k, v] of Object.entries({ HOME: demo, CLAUDE_HOME: empty, CODEX_HOME: empty, DESKTOP_SESSIONS: empty })) process.env[`ROUNDS_${k}`] = process.env[`WORKBENCH_${k}`] = v;
 }
 
 // From npx, the canvas runs as a child of this process. The dock's Update fetches the new release
@@ -151,14 +154,15 @@ async function start() {
   // Rounds never changes Claude's settings on its own.
   try {
     const s = JSON.parse(fs.readFileSync(path.join(CLAUDE, "settings.json"), "utf8"));
-    const ours = (s.hooks?.PostToolUse || []).filter((e) => (e.hooks || []).some((h) => OURS.test(String(h.command || ""))));
+    const { ourHook } = await import("./setup.mjs");
+    const ours = (s.hooks?.PostToolUse || []).filter((e) => (e.hooks || []).some((h) => ourHook.test(String(h.command || ""))));
     if (ours.length && !ours.some((e) => /\bArtifact\b/.test(e.matcher || ""))) say("To keep every page your sessions publish, even after its folder is cleared, run this once:\n  npx github:krispuckett/rounds init\n");
   } catch {}
   const port = Number(process.env.ROUNDS_PORT || loadConfig().port || 4797);
   process.env.ROUNDS_PORT = process.env.WORKBENCH_PORT = String(port);
   if (process.platform !== "darwin") say("Rounds is made for macOS. Elsewhere it runs, with screens shown at full size and no page previews unless Chrome is found.");
   if (!fs.existsSync(path.join(DATA, "index.json"))) {
-    say(rest.includes("--demo") ? "Setting up the demo…" : "Reading your Claude sessions for the first time…");
+    say(rest.includes("--demo") ? "Setting up the demo…" : "Reading your local sessions for the first time…");
     const { buildIndex } = await import("../server/indexer.mjs");
     await buildIndex({ log: (l) => say(`  ${l}`) });
   }
@@ -179,25 +183,23 @@ async function start() {
   if (!rest.includes("--no-open")) spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], { stdio: "ignore", detached: true }).unref();
 }
 
-// What init puts into Claude's settings, from any version of it (Workbench was its first name),
-// so a new init replaces the old and uninstall finds all of it.
-const OURS = /[\\/]bin[\\/](rounds|workbench)\.mjs"? hook /;
-const ourHooks = (settings) => {
-  let n = 0;
-  for (const [ev, list] of Object.entries(settings.hooks || {})) {
-    const kept = list.filter((e) => !(e.hooks || []).some((h) => OURS.test(String(h.command || ""))));
-    n += list.length - kept.length;
-    if (kept.length) settings.hooks[ev] = kept; else delete settings.hooks[ev];
-  }
-  return n;
-};
-const claudeCli = (args) => { try { execFileSync("claude", args, { stdio: "ignore" }); return true; } catch { return false; } };
+function prePushHook() {
+  const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] };
+  try {
+    // core.hooksPath can point to a shared folder outside this repository.
+    if (execFileSync("git", ["config", "--get", "core.hooksPath"], opts).trim()) return null;
+  } catch {}
+  try { return path.resolve(execFileSync("git", ["rev-parse", "--git-path", "hooks/pre-push"], opts).trim()); }
+  catch { return null; }
+}
+const ownedPushHook = (file) => fs.existsSync(file) &&
+  /^#!\/bin\/sh\n# (rounds|workbench):[^\n]*\n[^\n]+[\\/]bin[\\/](rounds|workbench)\.mjs["']? hook git-push "\$@" \|\| true\nexit 0\n?$/.test(fs.readFileSync(file, "utf8"));
 
 async function init() {
-  const { DATA, CLAUDE, CONFIG } = await import("../server/config.mjs");
+  const { DATA, CONFIG } = await import("../server/config.mjs");
+  const { installClient, rememberClient, rememberPushHook, hookCommand } = await import("./setup.mjs");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = async (q) => yes || /^y/i.test((await rl.question(`${q} [y/N] `)).trim());
-  const trial = !!process.env.ROUNDS_CLAUDE_HOME; // a stand-in Claude folder: Claude's own config is never touched
 
   say("Rounds keeps everything on this machine, in " + DATA);
   fs.mkdirSync(DATA, { recursive: true });
@@ -206,6 +208,7 @@ async function init() {
     say(`  Wrote ${CONFIG}. Name projects or keep work private there.`);
   }
   // From npx, Rounds copies itself to a folder that lasts, for the MCP server and the hooks to run.
+  rememberClient(client);
   let home = ROOT;
   if (fromNpx) {
     home = path.join(DATA, "app");
@@ -215,99 +218,56 @@ async function init() {
   const SELF = path.join(home, "bin", "rounds.mjs");
   say();
 
-  // 1. the MCP server, so sessions can post and read notes
-  const mcpLine = ["mcp", "add", "--scope", "user", "rounds", "--", "node", SELF, "mcp"];
-  if (await ask("Add the Rounds MCP server to Claude Code, so sessions can post their work?")) {
-    if (trial) say(`  (trial run) would run: claude ${mcpLine.join(" ")}`);
-    else {
-      for (const name of ["workbench", "rounds"]) claudeCli(["mcp", "remove", "--scope", "user", name]); // an older copy gives way
-      if (claudeCli(mcpLine)) say("  Added.");
-      else say(`  Couldn't run claude. Add it yourself:\n  claude ${mcpLine.map(quote).join(" ")}`);
-    }
-  }
-
-  // 2. the skill, which teaches Claude when and how to post
-  if (await ask("Install the rounds skill, so Claude knows when and how to post?")) {
-    const skills = path.join(CLAUDE, "skills");
-    const old = path.join(skills, "workbench", "SKILL.md");
-    if (fs.existsSync(old) && /^name: workbench$/m.test(fs.readFileSync(old, "utf8"))) fs.rmSync(path.dirname(old), { recursive: true, force: true });
-    const dest = path.join(skills, "rounds");
-    fs.mkdirSync(dest, { recursive: true });
-    fs.copyFileSync(path.join(home, "skill", "SKILL.md"), path.join(dest, "SKILL.md"));
-    say(`  Installed to ${dest}.`);
-  }
-
-  // 3. the hooks: notes reach their session; posts and pushes are tied to it
-  if (await ask("Add the hooks (your notes reach their session; pushes to main and published pages get recorded)?")) {
-    const file = path.join(CLAUDE, "settings.json");
-    let settings = {};
-    try { settings = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
-    // the first backup is the one that matters: a second run never overwrites it
-    const backup = [`${file}.before-rounds`, `${file}.before-workbench`].find((f) => fs.existsSync(f)) || `${file}.before-rounds`;
-    if (fs.existsSync(file) && !fs.existsSync(backup)) fs.copyFileSync(file, backup);
-    const saved = fs.existsSync(backup);
-    ourHooks(settings);
-    settings.hooks ||= {};
-    const run = (name) => ({ type: "command", command: `node "${SELF}" hook ${name}` });
-    (settings.hooks.UserPromptSubmit ||= []).push({ hooks: [run("notes")] });
-    (settings.hooks.PostToolUse ||= []).push({ matcher: "Bash|Artifact|mcp__rounds__rounds_post|mcp__rounds__rounds_change", hooks: [run("tool")] });
-    fs.mkdirSync(CLAUDE, { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(settings, null, 2));
-    say(`  Added to ${file}.${saved ? ` Your settings from before are in ${path.basename(backup)}.` : ""}`);
-  }
-
-  // 4. this repo: pushes made outside Claude show too, as their commits
-  let repo = "";
-  try { repo = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
-  if (repo) {
-    const hook = path.join(repo, ".git", "hooks", "pre-push");
-    const ours = fs.existsSync(hook) && /^# (rounds|workbench):/m.test(fs.readFileSync(hook, "utf8"));
-    if (fs.existsSync(hook) && !ours) say(`This repo already has a pre-push hook; left it alone. To add Rounds to it: node "${SELF}" hook git-push`);
-    else if (await ask(`Record pushes to main from ${path.basename(repo)} made outside Claude too?`)) {
-      fs.writeFileSync(hook, `#!/bin/sh\n# rounds: record pushes to main on the canvas; never stops a push\nnode "${SELF}" hook git-push "$@" || true\nexit 0\n`);
+  await installClient(client, SELF, ask);
+  const hook = prePushHook();
+  if (hook) {
+    const command = hookCommand(SELF, "git-push");
+    if (fs.existsSync(hook) && !ownedPushHook(hook)) say(`This repo already has a pre-push hook. To record pushes, add ${command} to it.`);
+    else if (await ask("Record pushes to main from this repository?")) {
+      fs.mkdirSync(path.dirname(hook), { recursive: true });
+      fs.writeFileSync(hook, `#!/bin/sh\n# rounds: record pushes to main on the canvas; never stops a push\n${command} "$@" || true\nexit 0\n`);
       fs.chmodSync(hook, 0o755);
-      say("  Added.");
+      rememberPushHook(client, hook);
+      say("  Added the pre-push hook.");
     }
   }
   rl.close();
 
   say();
-  say("Reading your Claude sessions…");
+  say("Reading your local sessions…");
   const { buildIndex } = await import("../server/indexer.mjs");
   await buildIndex({ log: (l) => say(`  ${l}`) });
   say();
   say(`Done. Open the canvas with: ${fromNpx ? "npx github:krispuckett/rounds" : `node ${quote(path.join(ROOT, "bin", "rounds.mjs"))}`}`);
-  say("New Claude sessions have Rounds; ones already open pick it up when you start them again.");
+  if (client !== "generic") say("Restart your client to load its updated configuration.");
 }
 
 async function uninstall() {
-  const { DATA, CLAUDE } = await import("../server/config.mjs");
+  const { DATA } = await import("../server/config.mjs");
+  const { labels, removeClient, forgetClient } = await import("./setup.mjs");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = async (q) => yes || /^y/i.test((await rl.question(`${q} [y/N] `)).trim());
-  if (!(await ask("Take Rounds out of Claude Code (the MCP server, the skill, the hooks)?"))) { rl.close(); return; }
+  if (!(await ask(`Remove the Rounds integration for ${labels[client]}?`))) { rl.close(); return; }
   rl.close();
-  const trial = !!process.env.ROUNDS_CLAUDE_HOME;
-  if (!trial) for (const name of ["rounds", "workbench"]) if (claudeCli(["mcp", "remove", "--scope", "user", name])) say(`  Removed the ${name} MCP server.`);
-  for (const name of ["rounds", "workbench"]) {
-    const skill = path.join(CLAUDE, "skills", name, "SKILL.md");
-    if (fs.existsSync(skill) && new RegExp(`^name: ${name}$`, "m").test(fs.readFileSync(skill, "utf8"))) { fs.rmSync(path.dirname(skill), { recursive: true, force: true }); say(`  Removed the ${name} skill.`); }
-  }
-  const file = path.join(CLAUDE, "settings.json");
-  try {
-    const settings = JSON.parse(fs.readFileSync(file, "utf8"));
-    const n = ourHooks(settings);
-    if (!Object.keys(settings.hooks || {}).length) delete settings.hooks;
-    if (n) { fs.writeFileSync(file, JSON.stringify(settings, null, 2)); say(`  Removed ${n} hook${n === 1 ? "" : "s"} from ${file}.`); }
-  } catch {}
-  let repo = "";
-  try { repo = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
-  const hook = repo && path.join(repo, ".git", "hooks", "pre-push");
-  if (hook && fs.existsSync(hook) && /^# (rounds|workbench):/m.test(fs.readFileSync(hook, "utf8"))) { fs.rmSync(hook); say(`  Removed this repo's pre-push hook.`); }
-  fs.rmSync(path.join(DATA, "app"), { recursive: true, force: true });
+  removeClient(client);
+  if (forgetClient(client, prePushHook(), ownedPushHook)) fs.rmSync(path.join(DATA, "app"), { recursive: true, force: true });
   say(`Done. Your canvas (screens, notes, history) is still in ${DATA}; delete that folder if you want it gone too.`);
 }
 
-if (!cmd || cmd === "start") await start();
+const help = [
+  "rounds [start|index|update|check|path|--demo]",
+  "rounds init [--client claude|codex|generic] [--yes]",
+  "rounds uninstall [--client claude|codex|generic] [--yes]",
+  "rounds mcp [--content-only]",
+  "Claude Code is the default setup client. Generic setup prints a local stdio configuration.",
+  "For ChatGPT through a secure MCP tunnel, use mcp --content-only.",
+].join("\n");
+
+if (rest.includes("--help") || rest.includes("-h") || cmd === "help") say(help);
+else if (["init", "uninstall"].includes(cmd) && ((clientFlag >= 0 && !selected) || !["claude", "codex", "generic"].includes(client))) {
+  say(help);
+  process.exitCode = 1;
+} else if (!cmd || cmd === "start") await start();
 else if (cmd === "init") await init();
 else if (cmd === "update") await update();
 else if (cmd === "path") say(ROOT);
@@ -321,6 +281,6 @@ else if (cmd === "hook") {
   if (!file) { say("rounds hook <notes|tool|git-push>"); process.exit(1); }
   await import(`../hooks/${file}.mjs`);
 } else {
-  say("rounds [init|update|uninstall|index|--demo]");
+  say(help);
   process.exit(1);
 }

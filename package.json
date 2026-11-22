@@ -1,7 +1,7 @@
 {
   "name": "rounds-app",
   "version": "1.2.0",
-  "description": "A local canvas of everything your Claude Code sessions make: screens, pages and pushed changes, by project and topic, with a time machine, before and after, and notes that go back to the session.",
+  "description": "A local canvas for work from Claude Code, Codex, ChatGPT and other MCP clients: screens, pages and pushed changes, by project and topic, with a time machine, before and after, and notes that go back to the session.",
   "license": "MIT",
   "author": "Kris Puckett",
   "homepage": "https://github.com/krispuckett/rounds#readme",
@@ -10,6 +10,8 @@
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
+    "chatgpt",
     "mcp",
     "canvas",
     "design"
@@ -37,6 +39,7 @@
     "topics": "node -e \"import('./server/topics.mjs').then(async (t) => { const i = JSON.parse(require('fs').readFileSync(require('path').join(require('os').homedir(), require('fs').existsSync(require('os').homedir() + '/.rounds') ? '.rounds' : '.workbench', 'index.json'), 'utf8')); console.log(await t.fileTopics(i, { log: console.log })); })\"",
     "build": "vite build",
     "start": "node bin/rounds.mjs",
+    "test": "node --test evals/*.test.mjs",
     "eval": "node evals/e2e.mjs",
     "release": "node scripts/release.mjs",
     "prepare": "vite build"

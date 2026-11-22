@@ -1,12 +1,13 @@
-export type Version = { at: number; hash: string };
+export type Version = { at: number; hash: string; thread?: string | null };
 export type Page = { id: string; url: string; title: string; thread: string | null; project: string; at: number; versions: Version[]; topic?: string; posted?: boolean };
+export const versionOwner = (page: Page, version: Version) => version.thread === undefined ? page.thread : version.thread;
 /** A thread gone from this Mac (its transcript cleaned up, its desktop record deleted) keeps its work on the canvas. */
 export type Thread = { id: string; title: string; cwd: string; archived: boolean; at: number; recap: string; project: string; days?: Record<string, number>; gone?: boolean };
 export type Comment = {
-  id: string; page: string; hash: string; x: number; y: number; text: string; at: number;
+  id: string; page: string; set?: string; hash: string; x: number; y: number; text: string; at: number;
   thread: string | null; state: "queued" | "sent" | "kept"; delivery?: string;
   /** how it reaches its session: the desktop relay, the notes hook, or not at all */
-  route?: "relay" | "hook" | "kept"; threadTitle?: string | null;
+  route?: "relay" | "hook" | "mcp" | "kept"; threadTitle?: string | null;
   reply?: { text: string; at: number };
 };
 export type Shot = { hash: string; ext: string; w: number; h: number; name: string };
@@ -44,9 +45,13 @@ export const thumb = (hash: string) => `/api/thumb/${hash}.jpg`;
 /** A kept screen, at a width the canvas can afford, or the original. */
 export const img = (s: Shot, w?: 240 | 480 | 960 | 1600) => `/api/img/${s.hash}.${s.ext}${w ? `@${w}.jpg` : ""}`;
 export const pageSrc = (hash: string) => `/api/page/${hash}`;
-export const threadLink = (id: string) => `claude://claude.ai/epitaxy/${id}`;
+export function threadLink(id: string) {
+  if (id.startsWith("codex-")) return `codex://threads/${encodeURIComponent(id.slice(6))}`;
+  if (id.startsWith("mcp-")) return `?session=${encodeURIComponent(id)}`;
+  return `claude://claude.ai/epitaxy/${encodeURIComponent(id)}`;
+}
 
-export async function postComment(c: { page: string; hash: string; x: number; y: number; text: string; set?: string }): Promise<Comment> {
+export async function postComment(c: { page: string; hash: string; x: number; y: number; text: string; set?: string; versionThread?: string | null }): Promise<Comment> {
   const r = await fetch("/api/comments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(c) });
   if (!r.ok) throw new Error(`comment not saved: ${r.status}`);
   return r.json();

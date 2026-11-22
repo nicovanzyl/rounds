@@ -14,7 +14,11 @@ import { DATA } from "./config.mjs";
 
 export const TOPICS = path.join(DATA, "topics.json");
 const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
-export const loadTopics = () => readJSON(TOPICS, { projects: {}, moves: {} });
+export function loadTopics() {
+  const topics = readJSON(TOPICS, { projects: {}, moves: {} });
+  topics.projects = Object.assign(Object.create(null), topics.projects);
+  return topics;
+}
 
 /** A send filed under another project's topic belongs to that project. */
 export function applyMoves(index, topics = loadTopics()) {
