@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { reducedTransparency } from "./look";
-import { clean, loadIndex, readSeen, markSeen, type Index, type Page } from "./data";
+import { clean, versionOwner, loadIndex, readSeen, markSeen, type Index, type Page } from "./data";
 import { layout, type Cluster, type Group } from "./layout";
 import { useCamera, fit, type Cam } from "./camera";
 import { spring } from "./motion";
@@ -153,7 +153,10 @@ export default function App() {
     ...index,
     threads: index.threads.filter((t) => t.id === chat),
     sets: index.sets.filter((s) => s.thread === chat),
-    pages: index.pages.filter((p) => p.thread === chat),
+    pages: index.pages.flatMap(p => {
+      const versions = p.versions.filter(v => versionOwner(p, v) === chat);
+      return versions.length ? [{ ...p, thread: chat, at: versions[versions.length - 1].at, versions }] : [];
+    }),
     changed: index.changed?.filter((c) => c.thread === chat),
   }), [index, chat]);
   const world = useMemo(() => (shown && index ? layout(shown, asOf, !!chat, index) : null), [shown, index, asOf, chat]);
@@ -487,15 +490,15 @@ export default function App() {
     camera.glide(framed(c));
   };
 
-  const openPage = (page: Page, el: HTMLElement, hash?: string) => {
+  const openPage = (page: Page, el: HTMLElement, versionIndex: number) => {
     const r = el.getBoundingClientRect();
     setFocus(null);
-    setOpen({ page, from: { x: r.left, y: r.top, w: r.width, h: r.height }, hash, place: tool === "comment" });
+    setOpen({ page, from: { x: r.left, y: r.top, w: r.width, h: r.height }, versionIndex, place: tool === "comment" });
     setSeen(markSeen(page.id));
   };
   const openItem = (g: Group, i: number, el: HTMLElement) => {
     const it = g.items[i];
-    if (it.kind === "page") return openPage(it.page, el, it.hash);
+    if (it.kind === "page") return openPage(it.page, el, it.versionIndex);
     const r = el.getBoundingClientRect();
     setFocus(null);
     setShotKey(it.key);
@@ -523,6 +526,10 @@ export default function App() {
     reform(!!id);
     refit.current = id ? { to: "session", find } : { to: "all" };
     touched.current = true;
+    const url = new URL(location.href);
+    if (id) url.searchParams.set("session", id);
+    else url.searchParams.delete("session");
+    history.replaceState(history.state, "", url);
     setChat(id);
     if (!find) setAsOf(null);
   };

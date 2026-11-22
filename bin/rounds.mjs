@@ -192,11 +192,12 @@ function prePushHook() {
   try { return path.resolve(execFileSync("git", ["rev-parse", "--git-path", "hooks/pre-push"], opts).trim()); }
   catch { return null; }
 }
-const ownedPushHook = (file) => fs.existsSync(file) && /^# (rounds|workbench):/m.test(fs.readFileSync(file, "utf8"));
+const ownedPushHook = (file) => fs.existsSync(file) &&
+  /^#!\/bin\/sh\n# (rounds|workbench):[^\n]*\n[^\n]+[\\/]bin[\\/](rounds|workbench)\.mjs["']? hook git-push "\$@" \|\| true\nexit 0\n?$/.test(fs.readFileSync(file, "utf8"));
 
 async function init() {
   const { DATA, CONFIG } = await import("../server/config.mjs");
-  const { installClient, rememberClient, shellArg } = await import("./setup.mjs");
+  const { installClient, rememberClient, rememberPushHook, hookCommand } = await import("./setup.mjs");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = async (q) => yes || /^y/i.test((await rl.question(`${q} [y/N] `)).trim());
 
@@ -220,12 +221,13 @@ async function init() {
   await installClient(client, SELF, ask);
   const hook = prePushHook();
   if (hook) {
-    const hookCommand = [process.execPath, SELF, "hook", "git-push"].map(shellArg).join(" ");
-    if (fs.existsSync(hook) && !ownedPushHook(hook)) say(`This repo already has a pre-push hook. To record pushes, add ${hookCommand} to it.`);
+    const command = hookCommand(SELF, "git-push");
+    if (fs.existsSync(hook) && !ownedPushHook(hook)) say(`This repo already has a pre-push hook. To record pushes, add ${command} to it.`);
     else if (await ask("Record pushes to main from this repository?")) {
       fs.mkdirSync(path.dirname(hook), { recursive: true });
-      fs.writeFileSync(hook, `#!/bin/sh\n# rounds: record pushes to main on the canvas; never stops a push\n${hookCommand} "$@" || true\nexit 0\n`);
+      fs.writeFileSync(hook, `#!/bin/sh\n# rounds: record pushes to main on the canvas; never stops a push\n${command} "$@" || true\nexit 0\n`);
       fs.chmodSync(hook, 0o755);
+      rememberPushHook(client, hook);
       say("  Added the pre-push hook.");
     }
   }
@@ -248,11 +250,7 @@ async function uninstall() {
   if (!(await ask(`Remove the Rounds integration for ${labels[client]}?`))) { rl.close(); return; }
   rl.close();
   removeClient(client);
-  if (forgetClient(client)) {
-    const hook = prePushHook();
-    if (hook && ownedPushHook(hook)) { fs.rmSync(hook); say("  Removed this repo's pre-push hook."); }
-    fs.rmSync(path.join(DATA, "app"), { recursive: true, force: true });
-  }
+  if (forgetClient(client, prePushHook(), ownedPushHook)) fs.rmSync(path.join(DATA, "app"), { recursive: true, force: true });
   say(`Done. Your canvas (screens, notes, history) is still in ${DATA}; delete that folder if you want it gone too.`);
 }
 

@@ -54,7 +54,7 @@ function readImage(url) {
 }
 
 export async function callContent(name, args, callLocal) {
-  let scratch;
+  let scratch, reservedIdentity;
   try {
     if (!Object.hasOwn(fields, name)) throw new Error("Unknown tool.");
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Expected tool arguments.");
@@ -100,19 +100,26 @@ export async function callContent(name, args, callLocal) {
         return filename;
       });
     }
+    // Reserve the identity before publishing. A registration failure must not leave a post
+    // on the canvas whose conversation never received a key.
+    if (!identity) {
+      fs.mkdirSync(sessions, { recursive: true });
+      fs.writeFileSync(identityFile, JSON.stringify({ project: projectName, title: sessionTitle }), { flag: "wx", mode: 0o600 });
+      reservedIdentity = identityFile;
+    }
     const result = await callLocal(name, local, context);
     if (scratch && result.isError) {
       for (const part of result.content) if (part.type === "text") part.text = part.text.replaceAll(scratch + path.sep, "");
     }
     if (!identity && !result.isError) {
-      fs.mkdirSync(sessions, { recursive: true });
-      fs.writeFileSync(identityFile, JSON.stringify({ project: projectName, title: sessionTitle }), { flag: "wx" });
+      reservedIdentity = null;
       result.content.push({ type: "text", text: `Keep this private session_key for subsequent calls in this conversation: ${key}` });
     }
     return result;
   } catch (error) {
     return { isError: true, content: [{ type: "text", text: error.code ? "Unable to store the supplied content." : error.message }] };
   } finally {
+    if (reservedIdentity) fs.rmSync(reservedIdentity, { force: true });
     if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
   }
 }

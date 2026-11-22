@@ -46,10 +46,21 @@ test("a content-only chat posts, versions, reads its pins and replies after reco
 
   // Identical content in separate chats still creates separate pages and note ownership.
   const html = "<!doctype html><title>Home</title><h1>Hello</h1>";
+  // Failure to create a retrievable chat identity leaves the canvas untouched.
+  const identities = path.join(dir, "content-sessions");
+  fs.writeFileSync(identities, "occupied");
+  assert.ok(post(html, { session_title: "Registration failed" }).isError);
+  fs.unlinkSync(identities);
+  assert.equal(fs.existsSync(path.join(dir, "posts")) && fs.readdirSync(path.join(dir, "posts")).length > 0, false);
   const first = post(html, { session_title: "First chat" });
   const key = privateKey(first);
   assert.ok(key, output(first));
+  // Once the post is durable, failure of the canvas wake-up stamp must not lose its key.
+  const stamp = path.join(dir, "posted");
+  fs.unlinkSync(stamp);
+  fs.mkdirSync(stamp);
   const other = privateKey(post(html, { session_title: "Another chat" }));
+  fs.rmdirSync(stamp);
   assert.ok(other && key !== other);
   let index = JSON.parse((await api("/api/index")).body);
   assert.equal(index.pages.length, 2);
@@ -82,6 +93,7 @@ test("a content-only chat posts, versions, reads its pins and replies after reco
   const pin = JSON.parse((await api("/api/comments", { page: "shot-" + screen.shots[0].hash, hash: screen.shots[0].hash, set: screen.id, x: 0.5, y: 0.5, text: "Check this image" })).body);
   assert.equal(pin.set, screen.id);
   assert.equal(pin.thread, owner.id);
+  assert.match(output(call("rounds_notes", { session_key: key })), /image 1 of 1/);
   assert.ok(call("rounds_post", { topic: "x", caption: "x", page: "/tmp/page.html" }).isError);
   assert.ok(call("rounds_change", { summary: "x", cwd: dir }).isError);
   assert.ok(call("rounds_notes", {}).isError);
@@ -93,6 +105,8 @@ test("a content-only chat posts, versions, reads its pins and replies after reco
   assert.ok(!rebuilt.sets.some(s => s.thread === owner.id));
   assert.ok(!rebuilt.pages.some(p => p.id === page.id));
   assert.ok(!rebuilt.comments.some(c => c.thread === owner.id));
+  assert.equal(output(call("rounds_notes", { session_key: key, all: true })), "No notes waiting.");
+  assert.ok(call("rounds_reply", { session_key: key, id: pin.id, reply: "Hidden" }).isError);
   assert.ok(!post("<h1>Private revision</h1>", { session_key: key }).isError);
   assert.ok(!JSON.parse((await api("/api/index")).body).pages.some(p => p.id === page.id));
 });

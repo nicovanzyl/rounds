@@ -2,7 +2,7 @@
 // it, and the thread's own name. Pick one and the canvas flies to it, back in time if needed.
 // A session itself turns up too, by its name: pick it and the canvas shows only what it made.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { clean, img, thumb, when, type Index } from "./data";
+import { clean, versionOwner, img, thumb, when, type Index } from "./data";
 import { Glyph } from "./glyphs";
 
 export type Hit = { key: string; kind: "topic" | "set" | "page" | "chat"; title: string; project: string; at: number; pic: string; text: string; find: string };
@@ -40,7 +40,7 @@ export function entries(index: Index): Hit[] {
   const last = new Map<string, number>();
   const made = (id: string | null, at: number) => { if (id && at > (last.get(id) ?? 0)) last.set(id, at); };
   for (const s of index.sets) made(s.thread, s.at);
-  for (const p of index.pages) for (const v of p.versions) made(p.thread, v.at);
+  for (const p of index.pages) for (const v of p.versions) made(versionOwner(p, v), v.at);
   for (const c of index.changed || []) made(c.thread, c.edits[c.edits.length - 1][0]);
   for (const t of index.threads) {
     const at = last.get(t.id);

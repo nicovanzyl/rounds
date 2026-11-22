@@ -55,7 +55,10 @@ test("generic clients keep conversation ownership across restarts, even for iden
   assert.notEqual(first.session, second.session);
   assert.equal(first.page.hash, second.page.hash);
   assert.equal(first.cwd, cwd);
-  fs.writeFileSync(path.join(home, "comments.json"), JSON.stringify([pin(first, "note-1"), pin(second, "note-2")]));
+  const collisionA = pin(first, "old-short-id"), collisionB = pin(second, "old-short-id");
+  fs.writeFileSync(path.join(home, "comments.json"), JSON.stringify([
+    pin(first, "note-1"), pin(second, "note-2"), collisionB, collisionA, { ...pin(first, "ambiguous"), thread: null },
+  ]));
   assert.match(call("claude-code", "rounds_notes", { cwd }).content[0].text, /No notes/);
   assert.equal(call("claude-ai", "rounds_notes", { cwd }, {}, ["--client", "generic"]).isError, true);
   const mismatch = call(client, "rounds_post", { ...post, session_id: "first", before: ["missing.png"] });
@@ -64,7 +67,11 @@ test("generic clients keep conversation ownership across restarts, even for iden
   const mine = { session_id: "first", cwd };
   const notes = call(client, "rounds_notes", mine).content[0].text;
   assert.match(notes, /Note note-1/);
-  assert.doesNotMatch(notes, /Note note-2/);
+  assert.doesNotMatch(notes, /Note note-2|ambiguous/);
+  assert.equal(call(client, "rounds_reply", { ...mine, id: "old-short-id", reply: "Only my pin" }).isError, undefined);
+  const updated = JSON.parse(fs.readFileSync(path.join(home, "comments.json")));
+  assert.equal(updated.find(c => c.id === "old-short-id" && c.thread === first.session).reply.text, "Only my pin");
+  assert.equal(updated.find(c => c.id === "old-short-id" && c.thread === second.session).reply, undefined);
   assert.equal(JSON.parse(fs.readFileSync(path.join(home, "sent", "note-1.json"))).session, first.session);
   assert.equal(call(client, "rounds_reply", { ...mine, id: "note-2", reply: "Wrong chat" }).isError, true);
   assert.equal(call(client, "rounds_reply", { ...mine, id: "note-1", reply: "Fixed" }).isError, undefined);
@@ -73,13 +80,15 @@ test("generic clients keep conversation ownership across restarts, even for iden
 });
 
 test("Codex tool metadata, explicit IDs and legacy Claude calls retain their native owners", t => {
-  const { cwd, call, posts } = fixture(t);
+  const { cwd, call, posts, env } = fixture(t);
   const id = "01234567-1111-2222-3333-444444444444";
   for (const [index, meta] of [{ threadId: id }, { "x-codex-turn-metadata": JSON.stringify({ thread_id: id }) }, {}].entries()) {
     const args = { cwd, summary: `Change ${index}`, ...(index === 2 && { session_id: id }) };
     const result = call("Other handshake name", "rounds_change", args, meta, ["--client", "codex"]);
     assert.equal(result.isError, undefined, JSON.stringify(result));
   }
+  env.CODEX_THREAD_ID = "00000000-0000-0000-0000-000000000001";
+  assert.equal(call("codex", "rounds_change", { cwd, session_id: id, summary: "From a child chat" }).isError, undefined);
   assert.ok(posts().every(p => p.session === `codex-${id}` && p.client === "codex"));
   assert.equal(call("claude-code", "rounds_post", { cwd, page: "index.html", caption: "Old call", topic: "Legacy" }).isError, undefined);
   assert.equal(posts().find(p => p.caption === "Old call").session, undefined); // attributed by hook
@@ -89,6 +98,8 @@ test("Codex tool metadata, explicit IDs and legacy Claude calls retain their nat
 
 test("concurrent pin and reply writers preserve every change", async t => {
   const { home, env } = fixture(t);
+  fs.mkdirSync(path.join(home, "comment-writers"));
+  fs.writeFileSync(path.join(home, "comment-writers", ".DS_Store"), "");
   const store = new URL("../server/comments-store.mjs", import.meta.url).href;
   const write = `import { updateComments } from ${JSON.stringify(store)}; for(let i=0;i<6;i++) await updateComments(list => list.push({id:process.pid+'-'+i}));`;
   await Promise.all(Array.from({ length: 4 }, () => new Promise((done, reject) => {
@@ -111,6 +122,7 @@ test("modern clients discover tools and make stateless calls without a handshake
     ["tools/list", { _meta: meta }],
     ["tools/call", { _meta: meta, name: "rounds_change", arguments: { session_id: "chat", summary: "Update", cwd } }],
     ["tools/list", { _meta: { ...meta, [version]: "future" } }],
+    ["tools/call", { _meta: { ...meta, "io.modelcontextprotocol/clientInfo": { name: "claude-code", version: "1" } }, name: "rounds_notes", arguments: { cwd } }],
   ].map(([method, params], id) => JSON.stringify({ jsonrpc: "2.0", id, method, params }));
   const proc = spawnSync(process.execPath, [server, "mcp"], { env, cwd: home, input: requests.join("\n") + "\n", encoding: "utf8" });
   assert.equal(proc.status, 0, proc.stderr);
@@ -121,4 +133,5 @@ test("modern clients discover tools and make stateless calls without a handshake
   assert.equal(replies[2].result.isError, undefined);
   assert.equal(posts()[0].client, "mcp");
   assert.equal(replies[3].error.code, -32022);
+  assert.ok(replies[4].result.isError, "stateless calls require a conversation ID");
 });

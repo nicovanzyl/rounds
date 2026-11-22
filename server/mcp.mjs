@@ -7,7 +7,7 @@ import readline from "node:readline";
 import { execFileSync } from "node:child_process";
 import { DATA, STORE, IMG, POSTS, loadConfig, projects } from "./config.mjs";
 import { keepImage } from "./indexer.mjs";
-
+import { myNotes } from "./session-notes.mjs";
 import { updateComments } from "./comments-store.mjs";
 
 const remote = process.argv.includes("--content-only") ? await import("./remote-content.mjs") : null;
@@ -15,7 +15,6 @@ const clientFlag = process.argv.indexOf("--client");
 const configuredClient = clientFlag === -1 ? process.argv.find(arg => arg.startsWith("--client="))?.slice(9) : process.argv[clientFlag + 1];
 let clientName = "";
 const cfg = loadConfig();
-const COMMENTS = path.join(DATA, "comments.json");
 const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
 const sha = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 16);
 const resolve = (p, cwd) => (p.startsWith("~") ? path.join(process.env.HOME || "", p.slice(1)) : path.resolve(cwd, p));
@@ -100,14 +99,17 @@ function keep(files = [], cwd) {
 }
 
 function save(post) {
-  if (!post.session) madeHere.add(post.id);
   fs.mkdirSync(POSTS, { recursive: true });
   const file = path.join(POSTS, `${post.id}.json`);
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(post, null, 1));
-  fs.renameSync(tmp, file);
-  // let a running canvas know there is something new (it reads posts as they land)
-  fs.writeFileSync(path.join(DATA, "posted"), String(Date.now()));
+  try { fs.renameSync(tmp, file); }
+  finally { fs.rmSync(tmp, { force: true }); }
+  if (!post.session) madeHere.add(post.id);
+  // The post is committed. Even if the wake-up stamp is unavailable, the canvas reads it
+  // on its next refresh and the client must receive its post ID and session key.
+  try { fs.writeFileSync(path.join(DATA, "posted"), String(Date.now())); }
+  catch (err) { console.error("Rounds could not notify the canvas of a saved post:", err.code); }
 }
 
 const link = (id) => `http://localhost:${process.env.ROUNDS_PORT || cfg.port}/#${id}`;
@@ -139,11 +141,12 @@ function localContext(a, meta = {}, requestClient = clientName) {
   const cwd = a.cwd ?? process.cwd();
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) throw new Error("cwd must be an absolute local project directory.");
   const client = configuredClient || requestClient;
+  const stateless = meta[versionKey] === modernVersion;
   let turn = meta["x-codex-turn-metadata"];
   if (typeof turn === "string") { try { turn = JSON.parse(turn); } catch { turn = null; } }
   const isCodex = configuredClient !== "generic" && (/codex/i.test(client) || !!turn);
-  const native = isCodex ? meta.threadId || turn?.thread_id || process.env.CODEX_THREAD_ID : null;
-  const raw = native || a.session_id;
+  const native = isCodex ? meta.threadId || turn?.thread_id : null;
+  const raw = native || a.session_id || (isCodex && !stateless && process.env.CODEX_THREAD_ID) || undefined;
   if (raw != null && (typeof raw !== "string" || !raw.trim() || raw.length > 512)) throw new Error("Use a nonempty session_id of at most 512 characters.");
   const claude = !isCodex && (/claude/i.test(client) || !client);
   const sessionTitle = typeof a.session_title === "string" ? a.session_title.trim().slice(0, 200) : "";
@@ -153,55 +156,14 @@ function localContext(a, meta = {}, requestClient = clientName) {
   }
   if (claude) {
     if (raw && !uuid.test(raw)) throw new Error("Use the Claude Code session UUID or omit session_id to let the hook identify it.");
+    // A modern client can multiplex unrelated chats over the same process. Only legacy
+    // Claude Code starts a dedicated server whose own hook-bound posts identify its chat.
+    if (stateless && !raw) throw new Error("Supply the Claude Code session UUID as session_id for this call.");
     const session = raw || process.env.CLAUDE_CODE_SESSION_ID || mySession();
     return { cwd, client: "claude", session, sessionTitle };
   }
   if (!raw) throw new Error("Supply a stable session_id for this conversation. Reuse it on all Rounds calls.");
   return { cwd, client: "mcp", session: `mcp-${sha(JSON.stringify([requestClient || "mcp", raw]))}`, sessionTitle: sessionTitle || raw };
-}
-
-function threadOwners(session, index) {
-  const ids = new Set(session ? [session] : []);
-  for (const t of index.threads || []) {
-    if (t.id === session || t.clis?.includes(session)) {
-      ids.add(t.id);
-      for (const cli of t.clis || []) ids.add(cli);
-    }
-  }
-  return ids;
-}
-
-function myNotes({ cwd, session, contentOnly }) {
-  const posts = fs.existsSync(POSTS) ? fs.readdirSync(POSTS).filter(f => f.endsWith(".json")).map(f => readJSON(path.join(POSTS, f), null)).filter(Boolean) : [];
-  const index = readJSON(path.join(DATA, "index.json"), {});
-  const ids = threadOwners(session, index);
-  // Older Claude setups learn the session from a hook after the first post.
-  const repo = (d) => { try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: d, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return d; } };
-  const here = session ? null : repo(cwd);
-  const mine = posts.filter(p => session ? ids.has(p.session) : (!p.client || p.client === "claude") && p.cwd && repo(p.cwd) === here);
-  if (!session) {
-    for (const p of mine) if (p.session) for (const id of threadOwners(p.session, index)) ids.add(id);
-    for (const t of index.threads || []) {
-      if (t.cwd && (!t.client || t.client === "claude") && repo(t.cwd) === here) ids.add(t.id);
-    }
-  }
-  const notes = [];
-  for (const c of readJSON(COMMENTS, [])) {
-    if (c.thread && !ids.has(c.thread)) continue;
-    if (contentOnly && c.thread !== session) continue;
-    const pagePin = !String(c.page || "").startsWith("shot-");
-    const post = mine.find(p => pagePin
-      ? p.page && c.page === `post-${p.page.key}` && c.hash === p.page.hash
-      : (!c.set || p.id === c.set) && p.shots?.some(s => s.hash === c.hash));
-    if (post) { notes.push({ c, post }); continue; }
-    // Screens and pages originally discovered in a native transcript may have no MCP post.
-    if (contentOnly || !c.thread) continue;
-    const item = pagePin ? index.pages?.find(p => p.id === c.page && p.versions.some(v => v.hash === c.hash))
-      : index.sets?.find(s => s.thread === c.thread && (!c.set || s.id === c.set) && s.shots?.some(sh => sh.hash === c.hash));
-    const owner = pagePin ? item?.versions.find(v => v.hash === c.hash)?.thread || item?.thread : item?.thread;
-    if (item && ids.has(owner)) notes.push({ c, post: { ...item, caption: item.caption || item.title } });
-  }
-  return notes.sort((a, b) => b.c.at - a.c.at);
 }
 
 function markRead(notes, session) {
@@ -216,11 +178,13 @@ function markRead(notes, session) {
 }
 
 function describe({ c, post }, contentOnly) {
-  const shot = (post.shots || []).find((s) => s.hash === c.hash);
+  const number = post.shots?.findIndex(s => s.hash === c.hash) ?? -1;
+  const shot = post.shots?.[number];
+  const image = shot && (contentOnly ? `image ${number + 1} of ${post.shots.length}` : path.join(STORE, "img", `${shot.hash}.${shot.ext}`));
   const lines = [
     `Note ${c.id}${c.reply ? " (answered)" : ""}: ${c.text}`,
     `On: "${post.caption}"${post.topic ? ` (topic: ${post.topic})` : ""}`,
-    shot ? `The screen: ${contentOnly ? "posted image" : path.join(STORE, "img", `${shot.hash}.${shot.ext}`)} (${shot.w}x${shot.h}), pinned at x ${Math.round(c.x * shot.w)}, y ${Math.round(c.y * shot.h)}` : `The page: ${contentOnly ? post.page?.title || post.caption : path.join(STORE, `${c.hash}.html`)}, pinned at x ${Math.round(c.x)}, y ${Math.round(c.y)} on the page at 1280 wide`,
+    shot ? `The screen: ${image} (${shot.w}x${shot.h}), pinned at x ${Math.round(c.x * shot.w)}, y ${Math.round(c.y * shot.h)}` : `The page: ${contentOnly ? post.page?.title || post.caption : path.join(STORE, `${c.hash}.html`)}, pinned at x ${Math.round(c.x)}, y ${Math.round(c.y)} on the page at 1280 wide`,
     c.reply ? `You replied: ${c.reply.text}` : null,
   ];
   return lines.filter(Boolean).join("\n");
@@ -251,9 +215,10 @@ async function call(name, a, context) {
       page = { key: inlinePage?.key || sha(p), hash, path: p, title: inlinePage?.title || html.match(/<title>([^<]{1,120})<\/title>/i)?.[1]?.trim() || path.basename(p, path.extname(p)) };
     }
     const post = { id: sha(crypto.randomUUID()), ...attribution, kind: page ? "page" : "screens", caption, topic, cwd, at: Date.now(), shots, ...(before.length ? { before } : {}), ...(page ? { page } : {}), ...(a.replaces ? { replaces: String(a.replaces) } : {}) };
+    const where = contentOnly ? "" : `, under ${projectName(post)}`;
     save(post);
     const what = page ? `the page "${page.title}"` : `${shots.length} screen${shots.length === 1 ? "" : "s"}`;
-    return text(`Saved to Rounds as post ${post.id}: ${what}${contentOnly ? "" : `, under ${projectName(post)}`}, topic "${topic}"${before.length ? ", with its before" : ""}. ${link(page && !shots.length ? `page-post-${page.key}` : post.id)}`);
+    return text(`Saved to Rounds as post ${post.id}: ${what}${where}, topic "${topic}"${before.length ? ", with its before" : ""}. ${link(page && !shots.length ? `page-post-${page.key}` : post.id)}`);
   }
   if (name === "rounds_change") {
     const summary = String(a.summary || "").trim();
@@ -277,10 +242,10 @@ async function call(name, a, context) {
     const reply = String(a.reply || "").trim();
     if (!reply) return text("The reply is empty.", true);
     const id = String(a.id);
-    if (!myNotes(context).some(({ c }) => c.id === id)) return text(`There is no note ${id} for this session.`, true);
     return updateComments(comments => {
-      const c = comments.find(x => x.id === id);
-      if (!c) return text(`There is no note ${id}.`, true);
+      const allowed = myNotes(context, comments.filter(c => c.id === id));
+      if (allowed.length !== 1) throw new Error(`There is no unique note ${id} for this session.`);
+      const { c } = allowed[0];
       c.reply = { text: reply, at: Date.now() };
       return text(`Your reply is on note ${c.id}.`);
     });

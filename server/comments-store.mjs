@@ -12,6 +12,7 @@ const queue = path.join(DATA, "comment-writers");
 function writers() {
   const active = [];
   for (const name of fs.readdirSync(queue)) {
+    if (!/^[1-9]\d*-[a-f0-9-]{36}$/.test(name)) continue;
     try {
       const pid = Number(name.split("-")[0]);
       process.kill(pid, 0);

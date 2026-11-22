@@ -1,5 +1,6 @@
-export type Version = { at: number; hash: string };
+export type Version = { at: number; hash: string; thread?: string | null };
 export type Page = { id: string; url: string; title: string; thread: string | null; project: string; at: number; versions: Version[]; topic?: string; posted?: boolean };
+export const versionOwner = (page: Page, version: Version) => version.thread === undefined ? page.thread : version.thread;
 /** A thread gone from this Mac (its transcript cleaned up, its desktop record deleted) keeps its work on the canvas. */
 export type Thread = { id: string; title: string; cwd: string; archived: boolean; at: number; recap: string; project: string; days?: Record<string, number>; gone?: boolean };
 export type Comment = {
@@ -50,7 +51,7 @@ export function threadLink(id: string) {
   return `claude://claude.ai/epitaxy/${encodeURIComponent(id)}`;
 }
 
-export async function postComment(c: { page: string; hash: string; x: number; y: number; text: string; set?: string }): Promise<Comment> {
+export async function postComment(c: { page: string; hash: string; x: number; y: number; text: string; set?: string; versionThread?: string | null }): Promise<Comment> {
   const r = await fetch("/api/comments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(c) });
   if (!r.ok) throw new Error(`comment not saved: ${r.status}`);
   return r.json();

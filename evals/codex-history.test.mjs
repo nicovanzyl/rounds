@@ -61,6 +61,22 @@ test("indexes local Codex work alongside Claude and portable posts, including ar
     done({ type: "McpToolCall", status: "completed", tool: "rounds_change", result: { content: [{ type: "text", text: "as post " + privatePostId }] } }, privateId),
   ].join("\n"));
   await writePost({ id: privatePostId });
+  async function subagent(child, parent, title, post, editedFile) {
+    const file = path.join(source, `rollout-${child}.jsonl`);
+    const rows = [
+      entry("session_meta", { id: child, cwd: root, source: { subagent: { thread_spawn: { parent_thread_id: parent } } } }),
+      done({ type: "UserMessage", content: [{ type: "text", text: title }] }, child),
+    ];
+    if (editedFile) rows.push(done({ type: "FileChange", status: "completed", id: child + "-patch",
+      changes: { [editedFile]: { type: "add", content: "from the child\n" } } }, child));
+    await fs.writeFile(file, rows.join("\n"));
+    await writePost({ id: post, session: `codex-${child}`, client: "codex", sessionTitle: "Codex session" });
+    return file;
+  }
+  const shortLived = "33333333-2222-3333-4444-555555555555";
+  const childFile = await subagent(shortLived, uuid, "Review", "child-post");
+  await subagent("44444444-2222-3333-4444-555555555555", privateId, "Review", "private-parent-post");
+  await subagent("55555555-2222-3333-4444-555555555555", uuid, "concealed draft", "private-child-post", "LICENSE");
   await writePost({ id: "portable", session: "mcp-portable", sessionTitle: "Other client", client: "mcp" });
   await writePost({ id: "claude", session: uuid, sessionTitle: "Claude session" });
   const postPage = async (id, text, at, session, sessionTitle) => {
@@ -71,6 +87,7 @@ test("indexes local Codex work alongside Claude and portable posts, including ar
   await postPage("page-a", "<p>First</p>", 1, id, "Codex session");
   await postPage("page-b", "<p>Second</p>", 2, "mcp-portable", "Other client");
   await postPage("page-c", "<p>Second</p>", 3, uuid, "Claude session");
+  await postPage("page-d", "<p>Second</p>", 4, uuid, "Claude session");
   await writePost({ id: "private-topic", topic: "concealed", shots: [{ hash: "abc", ext: "png" }] });
   await writePost({ id: "replacement", replaces: "private-topic" });
 
@@ -84,33 +101,47 @@ test("indexes local Codex work alongside Claude and portable posts, including ar
   assert.equal(index.sets.find((s) => s.id === privatePostId).thread, `codex-${privateId}`);
   assert.equal(index.threads.find((t) => t.id === "mcp-portable").client, "mcp");
   assert.equal(index.sets.find((s) => s.id === "claude").thread, uuid);
+  assert.equal(index.sets.find((s) => s.id === "child-post").thread, id);
+  assert.equal(index.sets.find((s) => s.id === "private-parent-post").thread, `codex-${privateId}`);
   assert.equal(index.pages[0].dir, "");
-  assert.deepEqual(index.pages[0].versions.map((v) => [v.at, v.thread]), [[1, id], [3, uuid]]);
+  assert.deepEqual(index.pages[0].versions.map((v) => [v.at, v.thread]), [[1, id], [2, "mcp-portable"], [4, uuid]]);
   if (!/^\/(private\/)?(tmp|var\/folders)\//.test(root)) {
     // The normal index excludes scratch repositories; use an existing project file under a checkout.
-    const changes = index.changed.filter((c) => c.thread === id);
+    const changes = index.changed.filter((c) => c.thread === id && c.file !== "LICENSE");
+    assert.ok(index.changed.some((c) => c.thread === id && c.file === "LICENSE"));
     assert.equal(changes.length, 1);
     assert.equal(changes[0].file, "README.md");
     assert.deepEqual(changes[0].edits.map((e) => e.slice(1)), [[2, 0], [1, 1], [1, 1]]);
     const edits = JSON.parse(await fs.readFile(path.join(data, "store", "edits", id + ".json")));
-    assert.deepEqual(Object.values(edits)[0][1].hunks, [{ o: 2, n: 2, lines: ["-second line", "+new line"] }]);
+    assert.deepEqual(edits[`${changes[0].repo}\nREADME.md`][1].hunks, [{ o: 2, n: 2, lines: ["-second line", "+new line"] }]);
   }
 
   await fs.writeFile(path.join(data, "config.json"), JSON.stringify({ private: ["concealed"] }));
+  await fs.unlink(childFile);
   await fs.appendFile(transcript, "\n" + done({ type: "UserMessage", content: [{ type: "text", text: "A new turn" }] }));
   const updated = await buildIndex();
   assert.deepEqual(Object.values(updated.threads.find((t) => t.id === id).days), [2]);
   assert.ok(!updated.threads.some((t) => t.id === `codex-${privateId}`));
   assert.ok(!updated.sets.some((s) => s.id === privatePostId));
+  assert.equal(updated.sets.find((s) => s.id === "child-post").thread, id);
+  assert.ok(updated.threads.find((t) => t.id === id).clis.includes(`codex-${shortLived}`));
+  assert.ok(!updated.sets.some((s) => s.id === "private-child-post" || s.id === "private-parent-post"));
+  assert.ok(!updated.changed.some((c) => c.thread === id && c.file === "LICENSE"));
   assert.ok(!updated.sets.some((s) => s.id === "private-topic"));
   assert.equal(updated.sets.find((s) => s.id === "replacement").before, undefined);
   assert.ok(JSON.parse(await fs.readFile(path.join(data, "private-history.json"))).sessions.includes(`codex-${privateId}`));
   await fs.unlink(transcript);
   await fs.unlink(archived);
+  await fs.writeFile(path.join(data, "config.json"), JSON.stringify({ private: ["other-private-pattern", "concealed"] }));
   const retained = await buildIndex();
   assert.ok(!retained.sets.some((s) => s.id === privatePostId));
+  assert.ok(!retained.sets.some((s) => s.id === "private-parent-post"));
   assert.ok(JSON.parse(await fs.readFile(path.join(data, "private-history.json"))).sessions.includes(`codex-${privateId}`));
   assert.equal(retained.sets.find((s) => s.id === mcpPostId).thread, id);
   assert.equal(retained.threads.find((t) => t.id === id).gone, true);
   assert.equal(retained.threads.find((t) => t.id === id).title, "User's thread name");
+  await fs.writeFile(path.join(data, "config.json"), JSON.stringify({ private: ["concealed"] }));
+  assert.ok(!(await buildIndex()).sets.some((s) => s.id === privatePostId));
+  await fs.writeFile(path.join(data, "config.json"), JSON.stringify({ private: ["other-private-pattern"] }));
+  assert.ok((await buildIndex()).sets.some((s) => s.id === privatePostId));
 });

@@ -8,7 +8,8 @@
 // get only their own. Each note is delivered once.
 import fs from "node:fs";
 import path from "node:path";
-import { DATA, POSTS, STORE } from "../server/config.mjs";
+import { DATA, STORE } from "../server/config.mjs";
+import { myNotes } from "../server/session-notes.mjs";
 import { updateNotice } from "../server/updates.mjs";
 
 // A new Rounds is said once, to the person, beside whatever notes this prompt brings to Claude.
@@ -35,32 +36,15 @@ const delivered = (c) => c.state === "sent" || fs.existsSync(path.join(SENT, `${
 // own message to the session runs this hook too, and the note would arrive twice. Past that the
 // relay isn't running, and the next message here brings it.
 const relaying = (c) => { try { return Date.now() - fs.statSync(path.join(INBOX, `${c.id}.json`)).mtimeMs < 5 * 60e3; } catch { return false; } };
-const waiting = comments.filter((c) => !delivered(c) && !c.reply && !relaying(c));
+const waiting = comments.filter((c) => /^[\w-]+$/.test(c.id) && !delivered(c) && !c.reply && !relaying(c));
 if (!waiting.length) await done();
 
-// this session's thread ids: itself, and any desktop thread it is the engine of
-const index = read(path.join(DATA, "index.json"), { threads: [], sets: [], pages: [] });
-const mine = new Set([session, ...index.threads.filter((t) => (t.clis || []).includes(session)).map((t) => t.id)]);
-
-let posts = [];
-try { posts = fs.readdirSync(POSTS).map((f) => read(path.join(POSTS, f), null)).filter(Boolean); } catch {}
-const postOf = (c) => posts.find((p) => {
-  if (c.set && c.set !== p.id) return false;
-  if (c.thread && p.session && c.thread !== p.session && !index.threads.some((t) => t.id === c.thread && t.clis?.includes(p.session))) return false;
-  if (p.page?.hash === c.hash && (!c.page || c.page === `post-${p.page.key}`)) return true;
-  return (!c.page || c.page.startsWith("shot-")) && (p.shots || []).some((s) => s.hash === c.hash);
-});
-
-// A pin can predate the tool hook that bound its post.
-const madeBy = (c) => postOf(c)?.session
-  || (index.sets || []).find((x) => x.thread && (!c.set || x.id === c.set) && x.shots.some((s) => s.hash === c.hash))?.thread
-  || (index.pages || []).find((x) => x.thread && (!c.page || x.id === c.page) && x.versions.some((v) => v.hash === c.hash))?.thread;
-const mineWaiting = waiting.filter((c) => mine.has(c.thread || madeBy(c)));
+const mineWaiting = myNotes({ session, cwd: input.cwd || process.cwd() }, waiting);
 if (!mineWaiting.length) await done();
 
 // A simultaneous MCP read or another hook can claim the same note.
 fs.mkdirSync(SENT, { recursive: true });
-const notes = mineWaiting.filter((c) => {
+const notes = mineWaiting.filter(({ c }) => {
   try {
     fs.writeFileSync(path.join(SENT, `${c.id}.json`), JSON.stringify({ delivery: "hook", session, at: Date.now() }), { flag: "wx" });
   } catch (err) { if (err.code === "EEXIST") return false; throw err; }
@@ -69,8 +53,7 @@ const notes = mineWaiting.filter((c) => {
 });
 if (!notes.length) await done();
 
-const lines = notes.map((c) => {
-  const p = postOf(c);
+const lines = notes.map(({ c, post: p }) => {
   const shot = p?.shots?.find((s) => s.hash === c.hash);
   const where = shot
     ? `on the screen ${path.join(STORE, "img", `${shot.hash}.${shot.ext}`)} (${shot.w}x${shot.h}), pinned at x ${Math.round(c.x * shot.w)}, y ${Math.round(c.y * shot.h)}`
